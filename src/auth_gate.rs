@@ -106,10 +106,15 @@ impl AuthGate {
             };
 
             match serde_json::to_string(&payload) {
-                Ok(payload) => info!(
-                    "Prepared Android auth payload for device {}: {}",
-                    device.device_uuid, payload
-                ),
+                Ok(payload) => {
+                    info!(
+                        "Prepared Android auth payload for device {}: {}",
+                        device.device_uuid, payload
+                    );
+                    info!(
+                        "NOTE: Push notification transport is not implemented. The notification cannot be sent directly to the device. Please manually authenticate using this payload via the /authenticate API endpoint."
+                    );
+                }
                 Err(err) => warn!(
                     "Failed to serialize Android auth payload for device {}: {}",
                     device.device_uuid, err
