@@ -137,7 +137,7 @@ impl AuthGate {
 
             let client = reqwest::Client::new();
             let url = std::env::var("ALOHOMORA_NOTIFICATION_URL")
-                .unwrap_or_else(|_| "https://alohomora.app/send-notification".to_string());
+                .unwrap_or_else(|_| "http://127.0.0.1:19922/send-notification".to_string());
 
             info!("Sending push notification to web service for device: {}", device.device_uuid);
             match client.post(&url).json(&request_body).send().await {

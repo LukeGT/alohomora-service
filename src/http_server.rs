@@ -105,13 +105,13 @@ struct ApiState {
 }
 
 #[derive(Debug)]
-struct ApiError {
+pub(crate) struct ApiError {
     status: StatusCode,
     message: String,
 }
 
 impl ApiError {
-    fn bad_request(message: impl Into<String>) -> Self {
+    pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
@@ -240,6 +240,8 @@ async fn register_setup(
     )
     .await?;
 
+    key_store::remove_temp_pairing_key(initialisation_token).await?;
+
     info!(
         "Registered Android device {} at device-keys/android/{}",
         request.device.model, request.device_uuid
@@ -267,7 +269,7 @@ async fn authenticate(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn validate_public_key_info(public_key: &PublicKeyInfo) -> std::result::Result<(), ApiError> {
+pub(crate) fn validate_public_key_info(public_key: &PublicKeyInfo) -> std::result::Result<(), ApiError> {
     if public_key.algorithm != "RSA-OAEP-256" {
         return Err(ApiError::bad_request(
             "public_key.algorithm must be RSA-OAEP-256",
@@ -280,10 +282,10 @@ fn validate_public_key_info(public_key: &PublicKeyInfo) -> std::result::Result<(
     }
     if public_key.parameters.digest != "SHA-256"
         || public_key.parameters.mgf != "MGF1"
-        || public_key.parameters.mgf_digest != "SHA-256"
+        || !matches!(public_key.parameters.mgf_digest.as_str(), "SHA-1" | "SHA-256")
     {
         return Err(ApiError::bad_request(
-            "public_key.parameters must specify SHA-256/MGF1/SHA-256",
+            "public_key.parameters must specify SHA-256/MGF1/(SHA-1 or SHA-256)",
         ));
     }
     Ok(())
@@ -293,16 +295,31 @@ fn encrypt_with_registration_public_key(
     public_key: &PublicKeyInfo,
     plaintext: &[u8],
 ) -> std::result::Result<SecureBlob, ApiError> {
+    encrypt_for_device(public_key, plaintext)
+}
+
+pub(crate) fn encrypt_for_device(
+    public_key: &PublicKeyInfo,
+    plaintext: &[u8],
+) -> std::result::Result<SecureBlob, ApiError> {
     let public_key_der = BASE64
         .decode(&public_key.value_b64)
         .map_err(|_| ApiError::bad_request("public_key.value_b64 is not valid base64"))?;
-    let public_key = RsaPublicKey::from_public_key_der(&public_key_der)
+    let rsa_key = RsaPublicKey::from_public_key_der(&public_key_der)
         .map_err(|_| ApiError::bad_request("public_key.value_b64 is not a valid SPKI RSA key"))?;
 
-    public_key
-        .encrypt(&mut OsRng, Oaep::new::<Sha256>(), plaintext)
-        .map_err(|err| ApiError::bad_request(format!("RSA-OAEP-256 encryption failed: {err}")))
-        .and_then(|encrypted| key_store::secure_blob_from_vec(encrypted).map_err(ApiError::from))
+    let encrypted = if public_key.parameters.mgf_digest == "SHA-256" {
+        rsa_key.encrypt(&mut OsRng, Oaep::new::<Sha256>(), plaintext)
+    } else {
+        rsa_key.encrypt(
+            &mut OsRng,
+            Oaep::new_with_mgf_hash::<Sha256, sha1::Sha1>(),
+            plaintext,
+        )
+    }
+    .map_err(|err| ApiError::bad_request(format!("RSA-OAEP-256 encryption failed: {err}")))?;
+
+    key_store::secure_blob_from_vec(encrypted).map_err(ApiError::from)
 }
 
 #[cfg(test)]
@@ -403,5 +420,57 @@ mod tests {
         assert_eq!(request.request_uuid, "6fbbce84-5aef-43c3-8cc7-469cbfd83109");
         assert_eq!(request.device_uuid, "f2018f87-e926-42a1-8b48-9ad4b7fd7cde");
         assert_eq!(request.decrypted_blob_b64, "base64-decrypted-blob");
+    }
+
+    #[test]
+    fn test_validate_public_key_info_and_encrypt_for_device_mgf1_sha1() {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+        use rsa::pkcs8::EncodePublicKey;
+        use rsa::RsaPrivateKey;
+
+        let mut rng = rand::rngs::OsRng;
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = private_key.to_public_key();
+        let spki_der = public_key.to_public_key_der().unwrap();
+        let value_b64 = BASE64.encode(spki_der.as_bytes());
+
+        let pk_info_sha1 = super::PublicKeyInfo {
+            algorithm: "RSA-OAEP-256".to_string(),
+            format: "X.509 SubjectPublicKeyInfo".to_string(),
+            value_b64: value_b64.clone(),
+            parameters: super::PublicKeyParameters {
+                digest: "SHA-256".to_string(),
+                mgf: "MGF1".to_string(),
+                mgf_digest: "SHA-1".to_string(),
+            },
+        };
+
+        // 1. Verify validation succeeds for SHA-1 MGF digest
+        assert!(super::validate_public_key_info(&pk_info_sha1).is_ok());
+
+        // 2. Verify encryption with encrypt_for_device succeeds with SHA-1
+        let plaintext = b"secret-token-bytes-1234";
+        let encrypted = super::encrypt_for_device(&pk_info_sha1, plaintext).unwrap();
+
+        // 3. Verify decryption with OAEP MGF1 SHA-1 recovers original plaintext
+        encrypted.unlock_slice(|ciphertext| {
+            let decrypted = private_key
+                .decrypt(
+                    rsa::Oaep::new_with_mgf_hash::<rsa::sha2::Sha256, sha1::Sha1>(),
+                    ciphertext,
+                )
+                .unwrap();
+            assert_eq!(decrypted, plaintext);
+        });
+
+        // 4. Verify validation also succeeds for SHA-256 MGF digest
+        let mut pk_info_sha256 = pk_info_sha1.clone();
+        pk_info_sha256.parameters.mgf_digest = "SHA-256".to_string();
+        assert!(super::validate_public_key_info(&pk_info_sha256).is_ok());
+
+        // 5. Verify validation rejects invalid MGF digest (e.g. SHA-512)
+        let mut pk_info_invalid = pk_info_sha1.clone();
+        pk_info_invalid.parameters.mgf_digest = "SHA-512".to_string();
+        assert!(super::validate_public_key_info(&pk_info_invalid).is_err());
     }
 }

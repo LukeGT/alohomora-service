@@ -117,13 +117,15 @@ pub async fn run_setup(config: &AppConfig) -> Result<bool> {
         None => read_or_create_local_key(&local_key_path).await?,
     };
 
-    if !has_existing_pairing_keys(&key_dir).await? {
-        create_temp_pairing_key(&key_dir, &local_key, config).await?;
-        Ok(true)
-    } else {
-        println!("Setup already completed.");
-        Ok(false)
+    // Clean up any stale temp pairing keys before creating a new one
+    clear_temp_pairing_keys(&key_dir).await?;
+
+    if has_device_keys(&key_dir).await? {
+        println!("Existing paired device(s) found. Generating new pairing token for re-pairing or additional device...");
     }
+
+    create_temp_pairing_key(&key_dir, &local_key, config).await?;
+    Ok(true)
 }
 
 async fn ensure_private_dir(path: &Path) -> Result {
@@ -409,6 +411,25 @@ pub async fn read_temp_secret_key(token: &str, local_key: &SecureKey) -> Result<
     SecureKey::try_from(secret_key).map_err(secure_memory_error)
 }
 
+pub async fn clear_temp_pairing_keys(key_dir: &Path) -> Result {
+    let temp_dir = key_dir.join(TEMP_PAIRING_KEYS_DIR);
+    match tokio::fs::remove_dir_all(&temp_dir).await {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub async fn remove_temp_pairing_key(token: &str) -> Result {
+    let pairing_token = parse_pairing_token(token)?;
+    let temp_dir = temp_pairing_key_dir(&get_key_dir(), &pairing_token.id);
+    match tokio::fs::remove_dir_all(&temp_dir).await {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub async fn store_android_device_registration(
     device_uuid: &str,
     encrypted_registration_json: &SecureBlob,
@@ -649,6 +670,10 @@ mod tests {
         startup_keys.local_key.unlock(|key_bytes| {
             assert_eq!(key_bytes, &mock_key);
         });
+
+        // 4. Running setup again should clean up stale temp keys and generate a new token cleanly
+        let setup_second = super::run_setup(&config).await;
+        assert_eq!(setup_second.unwrap(), true);
 
         // Clean up env vars
         if let Some(val) = original_key_dir {
