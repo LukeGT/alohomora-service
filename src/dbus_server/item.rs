@@ -365,6 +365,12 @@ impl Item<'static> {
                 .unwrap_or_else(|| "[unknown ID]".into())
         );
 
+        let access_info = access_info_from_header(&header, connection).await?;
+        let secret_key = self
+            .auth_gate
+            .request_secret_key(access_info.as_ref())
+            .await?;
+
         let secret_value =
             try_interface(object_server.interface::<_, Session>(&secret.session).await)?
                 .ok_or(Error::InvalidSession)?
@@ -373,7 +379,7 @@ impl Item<'static> {
                 .decrypt(secret, &header)?;
 
         self.store
-            .set_secret(&*self.collection_id, &*self.id, secret_value)
+            .set_secret(&*self.collection_id, &*self.id, secret_value, &secret_key)
             .await?;
 
         self.broadcast_collection_signal(connection, "ItemChanged")

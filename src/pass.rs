@@ -107,6 +107,7 @@ impl PasswordStore {
         command
     }
 
+    #[allow(dead_code)]
     fn add_symmetric_passphrase_args<'a>(&self, command: &'a mut Command) -> &'a mut Command {
         Self::add_symmetric_passphrase_args_with(command, &self.symmetric_gpg_passphrase)
     }
@@ -137,13 +138,65 @@ impl PasswordStore {
             .await
     }
 
+    async fn encrypt_with_passphrase(&self, value: &[u8], passphrase: &SecureString) -> Result<Vec<u8>> {
+        let mut command = self.make_gpg_process();
+        Self::add_symmetric_passphrase_args_with(&mut command, passphrase);
+
+        let mut process = command
+            .arg("--symmetric")
+            .arg("--cipher-algo")
+            .arg("AES256")
+            .arg("-")
+            .spawn()?;
+
+        let mut stdin = process.stdin.take().expect("child has stdin");
+        let value = value.to_vec();
+        tokio::task::spawn(async move { stdin.write_all(&value).await });
+
+        let output = process.wait_with_output().await?;
+        if output.status.success() {
+            Ok(output.stdout)
+        } else {
+            Err(Error::GpgError(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ))
+        }
+    }
+
+    async fn decrypt_with_passphrase(&self, encrypted_data: &[u8], passphrase: &SecureString) -> Result<Vec<u8>> {
+        let mut command = self.make_gpg_process();
+        Self::add_symmetric_passphrase_args_with(&mut command, passphrase);
+
+        command.arg("--decrypt").arg("-");
+
+        let mut process = command.spawn()?;
+        let mut stdin = process.stdin.take().expect("child has stdin");
+        let encrypted_data = encrypted_data.to_vec();
+        tokio::task::spawn(async move { stdin.write_all(&encrypted_data).await });
+
+        let output = process.wait_with_output().await?;
+        if output.status.success() {
+            Ok(output.stdout)
+        } else {
+            Err(Error::GpgError(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ))
+        }
+    }
+
     pub async fn read_password_with_key(
         &self,
         path: impl AsRef<Path>,
         key: &SecureKey,
     ) -> Result<Vec<u8>> {
-        let passphrase = key_store::key_to_passphrase(key);
-        self.read_password_with_passphrase(path, &passphrase).await
+        // 1. Decrypt outer layer using local_key (self.symmetric_gpg_passphrase)
+        let outer_decrypted = self.read_password_with_passphrase(path, &self.symmetric_gpg_passphrase).await?;
+
+        // 2. Decrypt inner layer using secret_key
+        let secret_passphrase = key_store::key_to_passphrase(key);
+        let inner_decrypted = self.decrypt_with_passphrase(&outer_decrypted, &secret_passphrase).await?;
+
+        Ok(inner_decrypted)
     }
 
     async fn read_password_with_passphrase(
@@ -152,28 +205,7 @@ impl PasswordStore {
         passphrase: &SecureString,
     ) -> Result<Vec<u8>> {
         let contents = read(self.get_full_secret_path(path)).await?;
-
-        let mut command = self.make_gpg_process();
-
-        Self::add_symmetric_passphrase_args_with(&mut command, passphrase);
-
-        command.arg("--decrypt").arg("-");
-
-        let mut process = command.spawn()?;
-
-        let mut stdin = process.stdin.take().expect("child has stdin");
-
-        tokio::task::spawn(async move { stdin.write_all(&contents).await });
-
-        let output = process.wait_with_output().await?;
-        if output.status.success() {
-            // gpg decrypted successfully
-            Ok(output.stdout)
-        } else {
-            Err(Error::GpgError(
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            ))
-        }
+        self.decrypt_with_passphrase(&contents, passphrase).await
     }
 
     /// Look for a `.gpg-id` file starting from `dir` up to `self.directory`.
@@ -208,48 +240,34 @@ impl PasswordStore {
             .await?)
     }
 
-    /// write a single password
-    pub async fn write_password(&self, path: impl AsRef<Path>, value: Vec<u8>) -> Result {
+    /// write a single password encrypted with both local_key and secret_key
+    pub async fn write_password_with_key(
+        &self,
+        path: impl AsRef<Path>,
+        value: Vec<u8>,
+        key: &SecureKey,
+    ) -> Result {
         let full_path = self.get_full_secret_path(path);
-
         let dir = full_path.parent().expect("path is a file");
-
         self.ensure_dirs(dir).await?;
 
-        let mut command = self.make_gpg_process();
-        self.add_symmetric_passphrase_args(&mut command);
+        // 1. Encrypt with secret_key first
+        let secret_passphrase = key_store::key_to_passphrase(key);
+        let inner_encrypted = self.encrypt_with_passphrase(&value, &secret_passphrase).await?;
 
-        let mut process = command
-            .arg("--symmetric")
-            .arg("--cipher-algo")
-            .arg("AES256")
-            .arg("-")
-            .spawn()?;
+        // 2. Encrypt with local_key
+        let outer_encrypted = self.encrypt_with_passphrase(&inner_encrypted, &self.symmetric_gpg_passphrase).await?;
 
-        let mut stdin = process.stdin.take().expect("child has stdin");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(self.file_mode)
+            .open(full_path)
+            .await?;
 
-        tokio::task::spawn(async move { stdin.write_all(&value).await });
-
-        let output = process.wait_with_output().await?;
-        if output.status.success() {
-            // encryption successful
-
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(self.file_mode)
-                .open(full_path)
-                .await?;
-
-            file.write_all(&output.stdout).await?;
-
-            Ok(())
-        } else {
-            Err(Error::GpgError(
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            ))
-        }
+        file.write_all(&outer_encrypted).await?;
+        Ok(())
     }
 
     pub async fn delete_password(&self, path: impl AsRef<Path>) -> Result {
@@ -417,3 +435,44 @@ impl PasswordStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secure_types::SecureArray;
+
+    #[tokio::test]
+    async fn test_write_and_read_password_with_key() {
+        let temp_dir = std::env::temp_dir().join(format!("test_pass_{}", nanoid::nanoid!()));
+        let local_passphrase = SecureString::from("local-test-passphrase");
+        let store = PasswordStore::from_env(Some(temp_dir.clone()), local_passphrase).unwrap();
+
+        let mut key_bytes = [42u8; 32];
+        let secret_key = SecureArray::from_slice_mut(&mut key_bytes).unwrap();
+
+        let secret_path = "test/secret";
+        let secret_value = b"super-secret-password-123".to_vec();
+
+        store
+            .write_password_with_key(secret_path, secret_value.clone(), &secret_key)
+            .await
+            .unwrap();
+
+        let decrypted = store
+            .read_password_with_key(secret_path, &secret_key)
+            .await
+            .unwrap();
+
+        assert_eq!(decrypted, secret_value);
+
+        // Verify that decrypting with wrong key fails
+        let mut wrong_bytes = [99u8; 32];
+        let wrong_key = SecureArray::from_slice_mut(&mut wrong_bytes).unwrap();
+        let wrong_result = store.read_password_with_key(secret_path, &wrong_key).await;
+        assert!(wrong_result.is_err());
+
+        // Cleanup
+        let _ = remove_dir_all(&temp_dir).await;
+    }
+}
+

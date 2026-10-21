@@ -18,7 +18,7 @@ use crate::{
 };
 
 use super::{
-    item::Item,
+    item::{access_info_from_header, Item},
     session::Session,
     utils::{
         alias_path, collection_path, secret_alias_path, secret_path, time_to_int, try_interface,
@@ -209,6 +209,12 @@ impl Collection<'static> {
         #[zbus(connection)] connection: &Connection,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(ObjectPath<'_>, ObjectPath<'_>)> {
+        let access_info = access_info_from_header(&header, connection).await?;
+        let secret_key = self
+            .auth_gate
+            .request_secret_key(access_info.as_ref())
+            .await?;
+
         let secret_value =
             try_interface(object_server.interface::<_, Session>(&secret.session).await)?
                 .ok_or(Error::InvalidSession)?
@@ -235,7 +241,7 @@ impl Collection<'static> {
             if let Some(secret_id) = matching_secret.into_iter().nth(0).map(Arc::new) {
                 // update the secret/label
                 self.store
-                    .set_secret(&*self.id, &*secret_id, secret_value)
+                    .set_secret(&*self.id, &*secret_id, secret_value, &secret_key)
                     .await?;
                 if let Some(label) = label {
                     self.store
@@ -253,12 +259,12 @@ impl Collection<'static> {
                 return Ok((path, EMPTY_PATH));
             } else {
                 self.store
-                    .create_secret(self.id.clone(), label, secret_value, attrs)
+                    .create_secret(self.id.clone(), label, secret_value, attrs, &secret_key)
                     .await?
             }
         } else {
             self.store
-                .create_secret(self.id.clone(), label, secret_value, attrs)
+                .create_secret(self.id.clone(), label, secret_value, attrs, &secret_key)
                 .await?
         };
 
