@@ -126,6 +126,12 @@ impl ApiError {
     }
 }
 
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.status, self.message)
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.status, self.message).into_response()
@@ -224,9 +230,6 @@ async fn register_setup(
     let locally_encrypted_secret_key = secret_key.unlock(|secret_key| {
         key_store::encrypt_aes256_gcm(&state.local_key, secret_key)
     })?;
-    let encrypted_secret_key = locally_encrypted_secret_key.unlock_slice(|encrypted| {
-        encrypt_with_registration_public_key(&request.public_key, encrypted)
-    })?;
 
     let registration_json = serde_json::to_vec(&request)
         .map_err(|err| ApiError::internal(format!("failed to serialize registration: {err}")))?;
@@ -236,7 +239,7 @@ async fn register_setup(
     key_store::store_android_device_registration(
         &request.device_uuid,
         &encrypted_registration,
-        &encrypted_secret_key,
+        &locally_encrypted_secret_key,
     )
     .await?;
 
@@ -289,13 +292,6 @@ pub(crate) fn validate_public_key_info(public_key: &PublicKeyInfo) -> std::resul
         ));
     }
     Ok(())
-}
-
-fn encrypt_with_registration_public_key(
-    public_key: &PublicKeyInfo,
-    plaintext: &[u8],
-) -> std::result::Result<SecureBlob, ApiError> {
-    encrypt_for_device(public_key, plaintext)
 }
 
 pub(crate) fn encrypt_for_device(
