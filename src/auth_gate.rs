@@ -109,6 +109,9 @@ struct AuthGateInner {
     local_key: SecureKey,
     domain: String,
     external_port: u16,
+    web_service_url: String,
+    notification_url: String,
+    use_relay: bool,
     pending: Mutex<HashMap<String, PendingAuth>>,
 }
 
@@ -133,6 +136,9 @@ impl AuthGate {
                 local_key,
                 domain: config.domain.clone(),
                 external_port: config.external_port,
+                web_service_url: config.web_service_url.clone(),
+                notification_url: config.notification_url(),
+                use_relay: config.use_relay,
                 pending: Mutex::new(HashMap::new()),
             }),
         }
@@ -158,10 +164,11 @@ impl AuthGate {
         let mut rng = OsRng;
         let ephemeral_private_key = RsaPrivateKey::new(&mut rng, 2048)
             .map_err(|_| Error::EncryptionError("failed to generate ephemeral RSA key"))?;
-        let ephemeral_public_key_spki = ephemeral_private_key
-            .to_public_key()
-            .to_public_key_der()
-            .map_err(|_| Error::EncryptionError("failed to encode ephemeral public key"))?;
+        let ephemeral_public_key_spki =
+            ephemeral_private_key
+                .to_public_key()
+                .to_public_key_der()
+                .map_err(|_| Error::EncryptionError("failed to encode ephemeral public key"))?;
         let ephemeral_public_key_b64 = BASE64.encode(ephemeral_public_key_spki.as_bytes());
 
         let (sender, receiver) = oneshot::channel();
@@ -175,6 +182,29 @@ impl AuthGate {
                     ephemeral_private_key,
                 },
             );
+        }
+
+        if self.inner.use_relay {
+            let auth_gate = self.clone();
+            let web_service_url = self.inner.web_service_url.clone();
+            let session_id = request_uuid_str.clone();
+            tokio::spawn(async move {
+                let client = reqwest::Client::new();
+                let res = crate::http_server::poll_relay_once(
+                    &client,
+                    &web_service_url,
+                    "authenticate",
+                    &session_id,
+                    AUTHORIZATION_TIMEOUT,
+                    |req: crate::http_server::AuthenticateRequest| async move {
+                        crate::http_server::process_authenticate_request(&auth_gate, req).await
+                    },
+                )
+                .await;
+                if let Err(err) = res {
+                    debug!("Relay authenticate poll ended: {err}");
+                }
+            });
         }
 
         for device in devices {
@@ -283,14 +313,13 @@ impl AuthGate {
             });
 
             let client = reqwest::Client::new();
-            let url = std::env::var("ALOHOMORA_NOTIFICATION_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:19922/send-notification".to_string());
+            let url = &self.inner.notification_url;
 
             info!(
                 "Sending push notification to web service for device: {}",
                 device.device_uuid
             );
-            match client.post(&url).json(&request_body).send().await {
+            match client.post(url).json(&request_body).send().await {
                 Ok(resp) => {
                     if resp.status().is_success() {
                         info!(
@@ -354,10 +383,7 @@ impl AuthGate {
         // Decrypt using OAEP with MGF1 SHA-1, falling back to OAEP SHA-256
         let decrypted = pending
             .ephemeral_private_key
-            .decrypt(
-                rsa::Oaep::new_with_mgf_hash::<Sha256, Sha1>(),
-                &ciphertext,
-            )
+            .decrypt(rsa::Oaep::new_with_mgf_hash::<Sha256, Sha1>(), &ciphertext)
             .or_else(|_| {
                 pending
                     .ephemeral_private_key
@@ -411,8 +437,7 @@ mod tests {
         assert_eq!(&challenge[53..137], &dummy_locally_encrypted);
 
         // 2. Create response plaintext
-        let response =
-            create_response_plaintext(&request_uuid, &dummy_locally_encrypted).unwrap();
+        let response = create_response_plaintext(&request_uuid, &dummy_locally_encrypted).unwrap();
         assert_eq!(response.len(), RESPONSE_PLAINTEXT_LEN);
         assert_eq!(&response[0..5], RESPONSE_MAGIC);
         assert_eq!(&response[5..21], request_uuid.as_bytes());
@@ -549,6 +574,8 @@ mod tests {
             domain: "test.example.com".to_string(),
             external_port: 443,
             internal_port: 19969,
+            web_service_url: "https://alohomora.app".to_string(),
+            use_relay: false,
         };
 
         let auth_gate = AuthGate::new(&config, local_key.clone());
@@ -578,9 +605,8 @@ mod tests {
         let original_secret_bytes = [88u8; 32];
         let locally_encrypted =
             key_store::encrypt_aes256_gcm(&local_key, &original_secret_bytes).unwrap();
-        let response_plaintext = locally_encrypted.unlock_slice(|enc_key| {
-            create_response_plaintext(&request_uuid, enc_key).unwrap()
-        });
+        let response_plaintext = locally_encrypted
+            .unlock_slice(|enc_key| create_response_plaintext(&request_uuid, enc_key).unwrap());
 
         let ephem_public_key =
             RsaPublicKey::from_public_key_der(ephemeral_spki.as_bytes()).unwrap();

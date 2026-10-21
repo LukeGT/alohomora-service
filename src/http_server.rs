@@ -1,4 +1,7 @@
-use std::net::{Ipv4Addr, SocketAddr};
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    time::Duration,
+};
 
 use axum::{
     extract::State,
@@ -105,20 +108,20 @@ struct ApiState {
 }
 
 #[derive(Debug)]
-pub(crate) struct ApiError {
-    status: StatusCode,
-    message: String,
+pub struct ApiError {
+    pub status: StatusCode,
+    pub message: String,
 }
 
 impl ApiError {
-    pub(crate) fn bad_request(message: impl Into<String>) -> Self {
+    pub fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
         }
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
@@ -175,7 +178,7 @@ pub async fn spawn(config: AppConfig, auth_gate: AuthGate) -> Result<JoinHandle<
 pub async fn spawn_setup_server(
     config: AppConfig,
     local_key: key_store::SecureKey,
-    done_tx: tokio::sync::oneshot::Sender<()>,
+    done_tx: std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 ) -> Result<JoinHandle<()>> {
     let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.internal_port));
     let listener = TcpListener::bind(addr).await?;
@@ -184,10 +187,7 @@ pub async fn spawn_setup_server(
         addr, config.domain, config.external_port
     );
 
-    let state = SetupApiState {
-        local_key,
-        done_tx: std::sync::Arc::new(tokio::sync::Mutex::new(Some(done_tx))),
-    };
+    let state = SetupApiState { local_key, done_tx };
 
     let app = Router::new()
         .route("/alohomora/register", post(register_setup))
@@ -200,9 +200,9 @@ pub async fn spawn_setup_server(
     }))
 }
 
-async fn register_setup(
-    State(state): State<SetupApiState>,
-    Json(request): Json<RegisterRequest>,
+pub async fn process_register_request(
+    local_key: &key_store::SecureKey,
+    request: RegisterRequest,
 ) -> std::result::Result<StatusCode, ApiError> {
     debug!(
         "Received registration request for {}:{} from {} {}",
@@ -225,16 +225,13 @@ async fn register_setup(
 
     validate_public_key_info(&request.public_key)?;
 
-    let secret_key =
-        key_store::read_temp_secret_key(initialisation_token, &state.local_key).await?;
-    let locally_encrypted_secret_key = secret_key.unlock(|secret_key| {
-        key_store::encrypt_aes256_gcm(&state.local_key, secret_key)
-    })?;
+    let secret_key = key_store::read_temp_secret_key(initialisation_token, local_key).await?;
+    let locally_encrypted_secret_key =
+        secret_key.unlock(|secret_key| key_store::encrypt_aes256_gcm(local_key, secret_key))?;
 
     let registration_json = serde_json::to_vec(&request)
         .map_err(|err| ApiError::internal(format!("failed to serialize registration: {err}")))?;
-    let encrypted_registration =
-        key_store::encrypt_aes256_gcm(&state.local_key, &registration_json)?;
+    let encrypted_registration = key_store::encrypt_aes256_gcm(local_key, &registration_json)?;
 
     key_store::store_android_device_registration(
         &request.device_uuid,
@@ -250,10 +247,33 @@ async fn register_setup(
         request.device.model, request.device_uuid
     );
 
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn register_setup(
+    State(state): State<SetupApiState>,
+    Json(request): Json<RegisterRequest>,
+) -> std::result::Result<StatusCode, ApiError> {
+    let status = process_register_request(&state.local_key, request).await?;
+
     if let Some(tx) = state.done_tx.lock().await.take() {
         let _ = tx.send(());
     }
 
+    Ok(status)
+}
+
+pub async fn process_authenticate_request(
+    auth_gate: &AuthGate,
+    request: AuthenticateRequest,
+) -> std::result::Result<StatusCode, ApiError> {
+    debug!(
+        "Received authentication approval for request {} from {} on device {}",
+        request.request_uuid, request.app.package_name, request.device_uuid
+    );
+    auth_gate
+        .complete_authentication(&request.request_uuid, &request.decrypted_blob_b64)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -261,18 +281,116 @@ async fn authenticate(
     State(state): State<ApiState>,
     Json(request): Json<AuthenticateRequest>,
 ) -> std::result::Result<StatusCode, ApiError> {
-    debug!(
-        "Received authentication approval for request {} from {} on device {}",
-        request.request_uuid, request.app.package_name, request.device_uuid
-    );
-    state
-        .auth_gate
-        .complete_authentication(&request.request_uuid, &request.decrypted_blob_b64)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
+    process_authenticate_request(&state.auth_gate, request).await
 }
 
-pub(crate) fn validate_public_key_info(public_key: &PublicKeyInfo) -> std::result::Result<(), ApiError> {
+pub async fn poll_relay_once<T, F, Fut>(
+    client: &reqwest::Client,
+    web_service_url: &str,
+    channel: &str,
+    session_id: &str,
+    total_timeout: Duration,
+    handler: F,
+) -> Result<()>
+where
+    T: serde::de::DeserializeOwned,
+    F: FnOnce(T) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<StatusCode, ApiError>>,
+{
+    let base = web_service_url.trim_end_matches('/');
+    let poll_url = format!("{base}/alohomora/relay/{channel}/{session_id}/poll");
+    let complete_url = format!("{base}/alohomora/relay/{channel}/{session_id}/complete");
+
+    let deadline = tokio::time::Instant::now() + total_timeout;
+    let mut handler_opt = Some(handler);
+
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+
+        let resp_result = client.get(&poll_url).timeout(remaining).send().await;
+        let resp = match resp_result {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("Relay poll network error on {poll_url}: {e}");
+                let sleep_dur = Duration::from_secs(1)
+                    .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+                if !sleep_dur.is_zero() {
+                    tokio::time::sleep(sleep_dur).await;
+                }
+                continue;
+            }
+        };
+
+        let status = resp.status();
+        if status == StatusCode::NO_CONTENT {
+            continue;
+        }
+
+        if status == StatusCode::OK {
+            let payload: T = match resp.json().await {
+                Ok(p) => p,
+                Err(e) => {
+                    let err_msg = format!("failed to deserialize relay payload: {e}");
+                    log::warn!("{err_msg}");
+                    let _ = client
+                        .post(&complete_url)
+                        .json(&serde_json::json!({
+                            "status": StatusCode::BAD_REQUEST.as_u16(),
+                            "message": err_msg,
+                        }))
+                        .send()
+                        .await;
+                    return Err(Error::InvalidRequest(err_msg));
+                }
+            };
+
+            let handler = match handler_opt.take() {
+                Some(h) => h,
+                None => {
+                    return Err(Error::InvalidRequest(
+                        "relay handler already consumed".into(),
+                    ));
+                }
+            };
+
+            let handler_result = handler(payload).await;
+            let complete_body = match &handler_result {
+                Ok(status) => serde_json::json!({
+                    "status": status.as_u16(),
+                }),
+                Err(err) => serde_json::json!({
+                    "status": err.status.as_u16(),
+                    "message": err.message,
+                }),
+            };
+
+            if let Err(post_err) = client.post(&complete_url).json(&complete_body).send().await {
+                log::warn!("Failed to send relay completion to {complete_url}: {post_err}");
+            }
+
+            return match handler_result {
+                Ok(_) => Ok(()),
+                Err(err) => Err(Error::InvalidRequest(err.message)),
+            };
+        }
+
+        log::warn!("Unexpected status {status} from relay poll on {poll_url}");
+        let sleep_dur = Duration::from_secs(1)
+            .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        if !sleep_dur.is_zero() {
+            tokio::time::sleep(sleep_dur).await;
+        }
+    }
+
+    Err(Error::InvalidRequest("relay polling timed out".into()))
+}
+
+pub(crate) fn validate_public_key_info(
+    public_key: &PublicKeyInfo,
+) -> std::result::Result<(), ApiError> {
     if public_key.algorithm != "RSA-OAEP-256" {
         return Err(ApiError::bad_request(
             "public_key.algorithm must be RSA-OAEP-256",
@@ -285,7 +403,10 @@ pub(crate) fn validate_public_key_info(public_key: &PublicKeyInfo) -> std::resul
     }
     if public_key.parameters.digest != "SHA-256"
         || public_key.parameters.mgf != "MGF1"
-        || !matches!(public_key.parameters.mgf_digest.as_str(), "SHA-1" | "SHA-256")
+        || !matches!(
+            public_key.parameters.mgf_digest.as_str(),
+            "SHA-1" | "SHA-256"
+        )
     {
         return Err(ApiError::bad_request(
             "public_key.parameters must specify SHA-256/MGF1/(SHA-1 or SHA-256)",
@@ -468,5 +589,283 @@ mod tests {
         let mut pk_info_invalid = pk_info_sha1.clone();
         pk_info_invalid.parameters.mgf_digest = "SHA-512".to_string();
         assert!(super::validate_public_key_info(&pk_info_invalid).is_err());
+    }
+
+    struct MockServerState {
+        poll_count: std::sync::atomic::AtomicUsize,
+        complete_bodies: tokio::sync::Mutex<Vec<serde_json::Value>>,
+        payload: serde_json::Value,
+    }
+
+    async fn mock_poll(
+        axum::extract::Path((_channel, _id)): axum::extract::Path<(String, String)>,
+        axum::extract::State(state): axum::extract::State<std::sync::Arc<MockServerState>>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let count = state
+            .poll_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if count == 0 {
+            axum::http::StatusCode::NO_CONTENT.into_response()
+        } else {
+            (
+                axum::http::StatusCode::OK,
+                axum::Json(state.payload.clone()),
+            )
+                .into_response()
+        }
+    }
+
+    async fn mock_complete(
+        axum::extract::Path((_channel, _id)): axum::extract::Path<(String, String)>,
+        axum::extract::State(state): axum::extract::State<std::sync::Arc<MockServerState>>,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> axum::http::StatusCode {
+        state.complete_bodies.lock().await.push(body);
+        axum::http::StatusCode::NO_CONTENT
+    }
+
+    #[tokio::test]
+    async fn test_poll_relay_once_register_request() {
+        let payload_json: serde_json::Value = serde_json::json!({
+            "schema_version": 1,
+            "device_uuid": "f2018f87-e926-42a1-8b48-9ad4b7fd7cde",
+            "keychain": {
+              "domain": "example.com",
+              "port": 443
+            },
+            "device_name": "Pixel 9",
+            "initialisation_token": "optional-token",
+            "public_key": {
+              "algorithm": "RSA-OAEP-256",
+              "format": "X.509 SubjectPublicKeyInfo",
+              "value_b64": "base64-public-key",
+              "parameters": {
+                "digest": "SHA-256",
+                "mgf": "MGF1",
+                "mgf_digest": "SHA-256"
+              }
+            },
+            "fcm": {
+              "token": "firebase-registration-token"
+            },
+            "app": {
+              "package_name": "com.alohomora.app",
+              "version_name": "0.1.0",
+              "version_code": 1
+            },
+            "device": {
+              "os": "Android",
+              "sdk_int": 36,
+              "release": "16",
+              "manufacturer": "Google",
+              "model": "Pixel",
+              "product": "pixel"
+            },
+            "registered_at_ms": 1760000000000_i64
+        });
+
+        let state = std::sync::Arc::new(MockServerState {
+            poll_count: std::sync::atomic::AtomicUsize::new(0),
+            complete_bodies: tokio::sync::Mutex::new(Vec::new()),
+            payload: payload_json.clone(),
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+
+        let app = axum::Router::new()
+            .route(
+                "/alohomora/relay/:channel/:id/poll",
+                axum::routing::get(mock_poll),
+            )
+            .route(
+                "/alohomora/relay/:channel/:id/complete",
+                axum::routing::post(mock_complete),
+            )
+            .with_state(state.clone());
+
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::new();
+        let handler_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler_called_clone = handler_called.clone();
+
+        let res = super::poll_relay_once::<RegisterRequest, _, _>(
+            &client,
+            &base_url,
+            "register",
+            "test-pairing-id",
+            std::time::Duration::from_secs(5),
+            |req: RegisterRequest| async move {
+                assert_eq!(req.device_uuid, "f2018f87-e926-42a1-8b48-9ad4b7fd7cde");
+                handler_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(axum::http::StatusCode::NO_CONTENT)
+            },
+        )
+        .await;
+
+        assert!(res.is_ok());
+        assert!(handler_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            state.poll_count.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+
+        let completed = state.complete_bodies.lock().await;
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0]["status"], 204);
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_poll_relay_once_authenticate_request() {
+        let payload_json: serde_json::Value = serde_json::json!({
+            "schema_version": 1,
+            "request_uuid": "6fbbce84-5aef-43c3-8cc7-469cbfd83109",
+            "device_uuid": "f2018f87-e926-42a1-8b48-9ad4b7fd7cde",
+            "keychain": {
+              "domain": "example.com",
+              "port": 443
+            },
+            "decrypted_blob_b64": "base64-decrypted-blob",
+            "app": {
+              "package_name": "com.alohomora.app",
+              "version_name": "0.1.0",
+              "version_code": 1
+            },
+            "approved_at_ms": 1760000000123_i64
+        });
+
+        let state = std::sync::Arc::new(MockServerState {
+            poll_count: std::sync::atomic::AtomicUsize::new(0),
+            complete_bodies: tokio::sync::Mutex::new(Vec::new()),
+            payload: payload_json.clone(),
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+
+        let app = axum::Router::new()
+            .route(
+                "/alohomora/relay/:channel/:id/poll",
+                axum::routing::get(mock_poll),
+            )
+            .route(
+                "/alohomora/relay/:channel/:id/complete",
+                axum::routing::post(mock_complete),
+            )
+            .with_state(state.clone());
+
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::new();
+        let handler_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler_called_clone = handler_called.clone();
+
+        let res = super::poll_relay_once::<AuthenticateRequest, _, _>(
+            &client,
+            &base_url,
+            "authenticate",
+            "test-request-uuid",
+            std::time::Duration::from_secs(5),
+            |req: AuthenticateRequest| async move {
+                assert_eq!(req.request_uuid, "6fbbce84-5aef-43c3-8cc7-469cbfd83109");
+                handler_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(axum::http::StatusCode::NO_CONTENT)
+            },
+        )
+        .await;
+
+        assert!(res.is_ok());
+        assert!(handler_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            state.poll_count.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+
+        let completed = state.complete_bodies.lock().await;
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0]["status"], 204);
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_poll_relay_once_handler_error_reporting() {
+        let payload_json: serde_json::Value = serde_json::json!({
+            "schema_version": 1,
+            "request_uuid": "6fbbce84-5aef-43c3-8cc7-469cbfd83109",
+            "device_uuid": "f2018f87-e926-42a1-8b48-9ad4b7fd7cde",
+            "keychain": {
+              "domain": "example.com",
+              "port": 443
+            },
+            "decrypted_blob_b64": "base64-decrypted-blob",
+            "app": {
+              "package_name": "com.alohomora.app",
+              "version_name": "0.1.0",
+              "version_code": 1
+            },
+            "approved_at_ms": 1760000000123_i64
+        });
+
+        let state = std::sync::Arc::new(MockServerState {
+            poll_count: std::sync::atomic::AtomicUsize::new(1), // return 200 on first poll
+            complete_bodies: tokio::sync::Mutex::new(Vec::new()),
+            payload: payload_json.clone(),
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+
+        let app = axum::Router::new()
+            .route(
+                "/alohomora/relay/:channel/:id/poll",
+                axum::routing::get(mock_poll),
+            )
+            .route(
+                "/alohomora/relay/:channel/:id/complete",
+                axum::routing::post(mock_complete),
+            )
+            .with_state(state.clone());
+
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::new();
+        let res = super::poll_relay_once::<AuthenticateRequest, _, _>(
+            &client,
+            &base_url,
+            "authenticate",
+            "test-request-uuid",
+            std::time::Duration::from_secs(5),
+            |_req: AuthenticateRequest| async move {
+                Err(super::ApiError::bad_request(
+                    "simulated authorization failure",
+                ))
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(res, Err(crate::error::Error::InvalidRequest(msg)) if msg == "simulated authorization failure")
+        );
+
+        let completed = state.complete_bodies.lock().await;
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0]["status"], 400);
+        assert_eq!(completed[0]["message"], "simulated authorization failure");
+
+        server_handle.abort();
     }
 }
