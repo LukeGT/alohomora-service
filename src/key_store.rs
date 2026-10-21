@@ -64,7 +64,11 @@ pub async fn read_local_key(path: &Path) -> Result<Option<SecureKey>> {
             match read(&cred_path).await {
                 Ok(bytes) => return Ok(Some(secure_key_from_vec(bytes)?)),
                 Err(e) => {
-                    log::warn!("Failed to read credential from systemd path {:?}: {}", cred_path, e);
+                    log::warn!(
+                        "Failed to read credential from systemd path {:?}: {}",
+                        cred_path,
+                        e
+                    );
                 }
             }
         }
@@ -72,7 +76,12 @@ pub async fn read_local_key(path: &Path) -> Result<Option<SecureKey>> {
 
     if path.exists() {
         let output = std::process::Command::new("systemd-creds")
-            .args(["decrypt", "--name=local_key.bin", path.to_str().unwrap(), "-"])
+            .args([
+                "decrypt",
+                "--name=local_key.bin",
+                path.to_str().unwrap(),
+                "-",
+            ])
             .output();
         match output {
             Ok(out) if out.status.success() => {
@@ -97,7 +106,8 @@ pub async fn read_local_key(path: &Path) -> Result<Option<SecureKey>> {
 pub async fn initialize(_config: &AppConfig) -> Result<StartupKeys> {
     let key_dir = get_key_dir();
     let local_key_path = key_dir.join(LOCAL_KEY_FILE);
-    let local_key = read_local_key(&local_key_path).await?
+    let local_key = read_local_key(&local_key_path)
+        .await?
         .ok_or(Error::SetupIncomplete)?;
 
     if !has_existing_pairing_keys(&key_dir).await? {
@@ -107,7 +117,7 @@ pub async fn initialize(_config: &AppConfig) -> Result<StartupKeys> {
     Ok(StartupKeys { local_key })
 }
 
-pub async fn run_setup(config: &AppConfig) -> Result<bool> {
+pub async fn run_setup(config: &AppConfig) -> Result<Option<PairingToken>> {
     let key_dir = get_key_dir();
     ensure_private_dir(&key_dir).await?;
 
@@ -124,8 +134,8 @@ pub async fn run_setup(config: &AppConfig) -> Result<bool> {
         println!("Existing paired device(s) found. Generating new pairing token for re-pairing or additional device...");
     }
 
-    create_temp_pairing_key(&key_dir, &local_key, config).await?;
-    Ok(true)
+    let pairing_token = create_temp_pairing_key(&key_dir, &local_key, config).await?;
+    Ok(Some(pairing_token))
 }
 
 async fn ensure_private_dir(path: &Path) -> Result {
@@ -168,7 +178,11 @@ async fn read_or_create_local_key(path: &Path) -> Result<SecureKey> {
             match read(&cred_path).await {
                 Ok(bytes) => return secure_key_from_vec(bytes),
                 Err(e) => {
-                    log::warn!("Failed to read credential from systemd path {:?}: {}", cred_path, e);
+                    log::warn!(
+                        "Failed to read credential from systemd path {:?}: {}",
+                        cred_path,
+                        e
+                    );
                 }
             }
         }
@@ -190,12 +204,16 @@ async fn read_or_create_local_key(path: &Path) -> Result<SecureKey> {
 
     secure_key.unlock(|key_bytes| {
         if let Some(stdin) = child.stdin.as_mut() {
-            stdin.write_all(key_bytes).map_err(|_| Error::EncryptionError("failed to write key to systemd-creds stdin"))?;
+            stdin.write_all(key_bytes).map_err(|_| {
+                Error::EncryptionError("failed to write key to systemd-creds stdin")
+            })?;
         }
         Ok::<(), Error>(())
     })?;
 
-    let output = child.wait_with_output().map_err(|_| Error::EncryptionError("failed to wait for systemd-creds"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|_| Error::EncryptionError("failed to wait for systemd-creds"))?;
     if !output.status.success() {
         return Err(Error::EncryptionError("systemd-creds encryption failed"));
     }
@@ -256,7 +274,7 @@ async fn create_temp_pairing_key(
     key_dir: &Path,
     local_key: &SecureKey,
     config: &AppConfig,
-) -> Result {
+) -> Result<PairingToken> {
     let pairing_token = generate_pairing_token();
     let temp_dir = temp_pairing_key_dir(key_dir, &pairing_token.id);
     ensure_private_dir(&temp_dir).await?;
@@ -277,7 +295,7 @@ async fn create_temp_pairing_key(
     println!("Initial Alohomora pairing token: {}", pairing_token.value);
     print_setup_qr_code(&pairing_token.value, config)?;
 
-    Ok(())
+    Ok(pairing_token)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -494,7 +512,9 @@ pub async fn read_android_device_registration(
     let decrypted = decrypt_aes256_gcm(local_key, &encrypted)?;
     let registration: serde_json::Value = decrypted
         .unlock_slice(|bytes| serde_json::from_slice(bytes))
-        .map_err(|e| Error::InvalidRequest(format!("Failed to parse device registration: {}", e)))?;
+        .map_err(|e| {
+            Error::InvalidRequest(format!("Failed to parse device registration: {}", e))
+        })?;
     Ok(registration)
 }
 
@@ -513,7 +533,10 @@ pub async fn clear_secret_store() -> Result {
         });
     let secret_service_dir = pass_dir.join("secret-service");
     if secret_service_dir.exists() {
-        log::info!("Deleting secret-service directory from password store: {:?}", secret_service_dir);
+        log::info!(
+            "Deleting secret-service directory from password store: {:?}",
+            secret_service_dir
+        );
         tokio::fs::remove_dir_all(&secret_service_dir).await?;
     }
 
@@ -581,7 +604,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_or_create_local_key_systemd_creds() {
-        let temp_file = std::env::temp_dir().join(format!("test_local_key_{}.bin", nanoid::nanoid!()));
+        let temp_file =
+            std::env::temp_dir().join(format!("test_local_key_{}.bin", nanoid::nanoid!()));
 
         // 1. Generate local key (which will encrypt it using systemd-creds)
         match super::read_or_create_local_key(&temp_file).await {
@@ -590,7 +614,12 @@ mod tests {
 
                 // 2. Read it back using systemd-creds decrypt to verify it works
                 let output = std::process::Command::new("systemd-creds")
-                    .args(["decrypt", "--name=local_key.bin", temp_file.to_str().unwrap(), "-"])
+                    .args([
+                        "decrypt",
+                        "--name=local_key.bin",
+                        temp_file.to_str().unwrap(),
+                        "-",
+                    ])
                     .output()
                     .unwrap();
                 assert!(output.status.success());
@@ -620,6 +649,8 @@ mod tests {
             domain: "test.com".to_string(),
             external_port: 12345,
             internal_port: 12345,
+            web_service_url: "https://alohomora.app".to_string(),
+            use_relay: false,
         };
 
         let result = super::initialize(&config).await;
@@ -653,11 +684,16 @@ mod tests {
             domain: "test.com".to_string(),
             external_port: 12345,
             internal_port: 12345,
+            web_service_url: "https://alohomora.app".to_string(),
+            use_relay: false,
         };
 
         // 1. Initially, initialize should fail because pairing keys don't exist yet
         let init_result = super::initialize(&config).await;
-        assert!(matches!(init_result, Err(crate::error::Error::SetupIncomplete)));
+        assert!(matches!(
+            init_result,
+            Err(crate::error::Error::SetupIncomplete)
+        ));
 
         // 2. Run setup
         let setup_result = super::run_setup(&config).await;
@@ -673,7 +709,7 @@ mod tests {
 
         // 4. Running setup again should clean up stale temp keys and generate a new token cleanly
         let setup_second = super::run_setup(&config).await;
-        assert_eq!(setup_second.unwrap(), true);
+        assert!(setup_second.unwrap().is_some());
 
         // Clean up env vars
         if let Some(val) = original_key_dir {
@@ -695,7 +731,8 @@ mod tests {
     async fn test_clear_secret_store_removes_directories() {
         let _guard = ENV_MUTEX.lock().unwrap();
         let temp_dir = std::env::temp_dir().join(format!("test_key_dir_{}", nanoid::nanoid!()));
-        let temp_pass_dir = std::env::temp_dir().join(format!("test_pass_dir_{}", nanoid::nanoid!()));
+        let temp_pass_dir =
+            std::env::temp_dir().join(format!("test_pass_dir_{}", nanoid::nanoid!()));
         let temp_secret_service_dir = temp_pass_dir.join("secret-service");
 
         std::fs::create_dir_all(&temp_dir).unwrap();
