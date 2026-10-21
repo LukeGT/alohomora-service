@@ -17,10 +17,8 @@ fn confirm_clear() -> bool {
     let _ = io::stdout().flush();
 
     let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_ok() {
-        if input.trim() == expected {
-            return true;
-        }
+    if io::stdin().read_line(&mut input).is_ok() && input.trim() == expected {
+        return true;
     }
     false
 }
