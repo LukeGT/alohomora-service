@@ -22,7 +22,7 @@ Does not require any additional dependencies to build (uses a pure-rust D-Bus im
 cargo build --release
 ```
 
-A systemd user unit and a D-Bus session activation file are located in the `systemd` directory
+Systemd service templates, D-Bus session configuration, and setup guides are located in the [`systemd`](systemd/) directory. See [`systemd/README.md`](systemd/README.md) for root service configuration and desktop session bus integration.
 
 ## Usage
 
