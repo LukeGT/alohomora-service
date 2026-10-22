@@ -127,6 +127,8 @@ struct AndroidAuthPayload {
     access_timestamp_ms: String,
     domain: String,
     port: String,
+    service_uuid: String,
+    service_name: String,
 }
 
 impl AuthGate {
@@ -157,6 +159,9 @@ impl AuthGate {
             warn!("Secret access requested but no Android devices are registered");
             return Err(Error::PermissionDenied);
         }
+
+        let key_dir = key_store::get_key_dir();
+        let service_identity = key_store::get_or_create_service_identity(&key_dir, None).await?;
 
         let request_uuid = Uuid::new_v4();
         let request_uuid_str = request_uuid.to_string();
@@ -282,6 +287,21 @@ impl AuthGate {
 
             let encrypted_blob =
                 encrypted_challenge.unlock_slice(|encrypted| BASE64.encode(encrypted));
+
+            let domain = registration["keychain"]["domain"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&self.inner.domain)
+                .to_string();
+
+            let port = if let Some(p) = registration["keychain"]["port"].as_u64() {
+                p.to_string()
+            } else if let Some(p) = registration["keychain"]["port"].as_str().filter(|s| !s.is_empty()) {
+                p.to_string()
+            } else {
+                self.inner.external_port.to_string()
+            };
+
             let payload = AndroidAuthPayload {
                 request_uuid: request_uuid_str.clone(),
                 encrypted_blob,
@@ -294,8 +314,10 @@ impl AuthGate {
                     .map(|a| a.timestamp)
                     .unwrap_or_default()
                     .to_string(),
-                domain: self.inner.domain.clone(),
-                port: self.inner.external_port.to_string(),
+                domain: domain.clone(),
+                port: port.clone(),
+                service_uuid: service_identity.service_uuid.clone(),
+                service_name: service_identity.service_name.clone(),
             };
 
             let request_body = serde_json::json!({
@@ -310,6 +332,8 @@ impl AuthGate {
                 "access_timestamp_ms": payload.access_timestamp_ms,
                 "domain": payload.domain,
                 "port": payload.port,
+                "service_uuid": payload.service_uuid,
+                "service_name": payload.service_name,
             });
 
             let client = reqwest::Client::new();

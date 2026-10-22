@@ -28,6 +28,13 @@ use crate::{
 
 const KEY_DIR: &str = "/var/lib/alohomora-service";
 pub const LOCAL_KEY_FILE: &str = "local_key.bin";
+pub const SERVICE_IDENTITY_FILE: &str = "service_identity.json";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ServiceIdentity {
+    pub service_uuid: String,
+    pub service_name: String,
+}
 const DEVICE_KEYS_DIR: &str = "device-keys";
 const ANDROID_DEVICE_KEYS_DIR: &str = "android";
 const TEMP_PAIRING_KEYS_DIR: &str = "temp-pairing-keys";
@@ -103,6 +110,109 @@ pub async fn read_local_key(path: &Path) -> Result<Option<SecureKey>> {
     Ok(None)
 }
 
+pub fn get_default_service_name() -> String {
+    if let Ok(hostname) = std::fs::read_to_string("/etc/hostname") {
+        let trimmed = hostname.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    "Alohomora Service".to_string()
+}
+
+pub async fn read_service_identity(key_dir: &Path) -> Result<Option<ServiceIdentity>> {
+    let path = key_dir.join(SERVICE_IDENTITY_FILE);
+    match read(&path).await {
+        Ok(bytes) => {
+            let identity: ServiceIdentity = serde_json::from_slice(&bytes)
+                .map_err(|e| Error::InvalidRequest(format!("failed to parse service identity: {e}")))?;
+            Ok(Some(identity))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub async fn write_service_identity(key_dir: &Path, identity: &ServiceIdentity) -> Result<()> {
+    let json_bytes = serde_json::to_vec_pretty(identity)
+        .map_err(|e| Error::InvalidRequest(format!("failed to serialize service identity: {e}")))?;
+    ensure_private_dir(key_dir).await?;
+    write_private_file(&key_dir.join(SERVICE_IDENTITY_FILE), &json_bytes).await?;
+    Ok(())
+}
+
+pub async fn get_or_create_service_identity(
+    key_dir: &Path,
+    provided_name: Option<String>,
+) -> Result<ServiceIdentity> {
+    let clean_provided = provided_name
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Some(mut identity) = read_service_identity(key_dir).await? {
+        if let Some(new_name) = clean_provided {
+            if identity.service_name != new_name {
+                identity.service_name = new_name;
+                write_service_identity(key_dir, &identity).await?;
+            }
+        }
+        return Ok(identity);
+    }
+
+    let service_uuid = uuid::Uuid::new_v4().to_string();
+    let service_name = if let Some(name) = clean_provided {
+        name
+    } else if let Some(env_name) = std::env::var("ALOHOMORA_SERVICE_NAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        env_name
+    } else {
+        #[cfg(not(test))]
+        {
+            let default_name = get_default_service_name();
+            print!(
+                "Enter a friendly name for this Alohomora service [default: {}]: ",
+                default_name
+            );
+            let _ = std::io::stdout().flush();
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_ok() && !line.trim().is_empty() {
+                line.trim().to_string()
+            } else {
+                default_name
+            }
+        }
+        #[cfg(test)]
+        {
+            get_default_service_name()
+        }
+    };
+
+    let identity = ServiceIdentity {
+        service_uuid,
+        service_name,
+    };
+    write_service_identity(key_dir, &identity).await?;
+    Ok(identity)
+}
+
+pub fn url_encode(s: &str) -> String {
+    let mut encoded = String::with_capacity(s.len());
+    for byte in s.as_bytes() {
+        match *byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(*byte as char);
+            }
+            b => {
+                encoded.push_str(&format!("%{:02X}", b));
+            }
+        }
+    }
+    encoded
+}
+
 pub async fn initialize(_config: &AppConfig) -> Result<StartupKeys> {
     let key_dir = get_key_dir();
     let local_key_path = key_dir.join(LOCAL_KEY_FILE);
@@ -117,7 +227,9 @@ pub async fn initialize(_config: &AppConfig) -> Result<StartupKeys> {
     Ok(StartupKeys { local_key })
 }
 
-pub async fn run_setup(config: &AppConfig) -> Result<Option<PairingToken>> {
+pub async fn prepare_setup_keys(
+    provided_name: Option<String>,
+) -> Result<(PathBuf, SecureKey, ServiceIdentity)> {
     let key_dir = get_key_dir();
     ensure_private_dir(&key_dir).await?;
 
@@ -127,14 +239,43 @@ pub async fn run_setup(config: &AppConfig) -> Result<Option<PairingToken>> {
         None => read_or_create_local_key(&local_key_path).await?,
     };
 
+    let identity = get_or_create_service_identity(&key_dir, provided_name).await?;
+
+    Ok((key_dir, local_key, identity))
+}
+
+pub async fn run_setup(config: &AppConfig) -> Result<Option<PairingToken>> {
+    let (key_dir, local_key, identity) = prepare_setup_keys(None).await?;
+
     // Clean up any stale temp pairing keys before creating a new one
+    clear_temp_pairing_keys(&key_dir).await?;
+
+    if has_device_keys(&key_dir).await? {
+        return Err(Error::InvalidRequest(
+            "Existing paired device(s) found. Secret key must be authenticated from an existing device.".into(),
+        ));
+    }
+
+    let secret_key = generate_random_secret_key()?;
+    let pairing_token =
+        create_temp_pairing_key(&key_dir, &local_key, &secret_key, config, &identity).await?;
+    Ok(Some(pairing_token))
+}
+
+pub async fn run_setup_with_secret_key(
+    config: &AppConfig,
+    secret_key: &SecureKey,
+) -> Result<Option<PairingToken>> {
+    let (key_dir, local_key, identity) = prepare_setup_keys(None).await?;
+
     clear_temp_pairing_keys(&key_dir).await?;
 
     if has_device_keys(&key_dir).await? {
         println!("Existing paired device(s) found. Generating new pairing token for re-pairing or additional device...");
     }
 
-    let pairing_token = create_temp_pairing_key(&key_dir, &local_key, config).await?;
+    let pairing_token =
+        create_temp_pairing_key(&key_dir, &local_key, secret_key, config, &identity).await?;
     Ok(Some(pairing_token))
 }
 
@@ -228,7 +369,17 @@ async fn has_existing_pairing_keys(key_dir: &Path) -> Result<bool> {
     Ok(has_device_keys(key_dir).await? || has_temp_pairing_keys(key_dir).await?)
 }
 
-async fn has_device_keys(key_dir: &Path) -> Result<bool> {
+pub fn generate_random_secret_key() -> Result<SecureKey> {
+    let mut secret_key = [0u8; AES256_KEY_BYTES];
+    OsRng.fill_bytes(&mut secret_key);
+    secure_key_from_array(secret_key)
+}
+
+pub async fn has_registered_devices() -> Result<bool> {
+    has_device_keys(&get_key_dir()).await
+}
+
+pub async fn has_device_keys(key_dir: &Path) -> Result<bool> {
     let android_dir = key_dir.join(DEVICE_KEYS_DIR).join(ANDROID_DEVICE_KEYS_DIR);
     let mut entries = match read_dir(android_dir).await {
         Ok(entries) => entries,
@@ -270,18 +421,16 @@ async fn has_temp_pairing_keys(key_dir: &Path) -> Result<bool> {
     Ok(false)
 }
 
-async fn create_temp_pairing_key(
+pub async fn create_temp_pairing_key(
     key_dir: &Path,
     local_key: &SecureKey,
+    secret_key: &SecureKey,
     config: &AppConfig,
+    identity: &ServiceIdentity,
 ) -> Result<PairingToken> {
     let pairing_token = generate_pairing_token();
     let temp_dir = temp_pairing_key_dir(key_dir, &pairing_token.id);
     ensure_private_dir(&temp_dir).await?;
-
-    let mut secret_key = [0u8; AES256_KEY_BYTES];
-    OsRng.fill_bytes(&mut secret_key);
-    let secret_key = secure_key_from_array(secret_key)?;
 
     let token_key = derive_token_key(&pairing_token.value)?;
 
@@ -293,7 +442,7 @@ async fn create_temp_pairing_key(
     write_private_secure_file(&temp_dir.join(ENC_SECRET_KEY_FILE), &token_encrypted)?;
 
     println!("Initial Alohomora pairing token: {}", pairing_token.value);
-    print_setup_qr_code(&pairing_token.value, config)?;
+    print_setup_qr_code(&pairing_token.value, config, identity)?;
 
     Ok(pairing_token)
 }
@@ -345,10 +494,18 @@ pub fn parse_pairing_token(token: &str) -> Result<PairingToken> {
     })
 }
 
-fn print_setup_qr_code(token: &str, config: &AppConfig) -> Result {
+pub fn print_setup_qr_code(
+    token: &str,
+    config: &AppConfig,
+    identity: &ServiceIdentity,
+) -> Result {
     let setup_url = format!(
-        "https://alohomora.app/register?d={}&p={}&t={token}",
-        config.domain, config.external_port
+        "https://alohomora.app/register?d={}&p={}&t={}&su={}&sn={}",
+        config.domain,
+        config.external_port,
+        token,
+        identity.service_uuid,
+        url_encode(&identity.service_name)
     );
     let qr_code =
         QrCode::new(setup_url.as_bytes()).map_err(|_| Error::EncryptionError("invalid QR data"))?;
@@ -770,5 +927,125 @@ mod tests {
 
         // Clean up temp dirs
         let _ = std::fs::remove_dir_all(&temp_pass_dir);
+    }
+
+    #[tokio::test]
+    async fn test_service_identity_lifecycle_and_url_encoding() {
+        let temp_dir = std::env::temp_dir().join(format!("test_identity_dir_{}", nanoid::nanoid!()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Initially no identity exists
+        assert!(super::read_service_identity(&temp_dir).await.unwrap().is_none());
+
+        // 2. Create service identity with provided name
+        let identity = super::get_or_create_service_identity(&temp_dir, Some("Alice's Laptop & Co.".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(identity.service_name, "Alice's Laptop & Co.");
+        assert!(!identity.service_uuid.is_empty());
+
+        // 3. Read it back
+        let read_back = super::read_service_identity(&temp_dir).await.unwrap().unwrap();
+        assert_eq!(read_back, identity);
+
+        // 4. Calling get_or_create without name returns existing without changing uuid
+        let same = super::get_or_create_service_identity(&temp_dir, None).await.unwrap();
+        assert_eq!(same, identity);
+
+        // 5. Calling with a new name updates the name while preserving service_uuid
+        let updated = super::get_or_create_service_identity(&temp_dir, Some("Alice Workstation".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(updated.service_uuid, identity.service_uuid);
+        assert_eq!(updated.service_name, "Alice Workstation");
+
+        let read_updated = super::read_service_identity(&temp_dir).await.unwrap().unwrap();
+        assert_eq!(read_updated.service_name, "Alice Workstation");
+
+        // 6. Test url_encode helper
+        let encoded = super::url_encode("Alice's Laptop & Co.");
+        assert_eq!(encoded, "Alice%27s%20Laptop%20%26%20Co.");
+
+        // 7. Verify QR code setup URL generation
+        let config = crate::config::AppConfig {
+            domain: "relay.alohomora.app".to_string(),
+            external_port: 8443,
+            internal_port: 19969,
+            web_service_url: "https://alohomora.app".to_string(),
+            use_relay: true,
+        };
+        let token = "alohomora-testtoken1-1234567890";
+        let expected_url = format!(
+            "https://alohomora.app/register?d=relay.alohomora.app&p=8443&t={}&su={}&sn={}",
+            token,
+            updated.service_uuid,
+            super::url_encode(&updated.service_name)
+        );
+        assert!(expected_url.contains(&format!("su={}", updated.service_uuid)));
+        assert!(expected_url.contains(&format!("sn={}", super::url_encode(&updated.service_name))));
+
+        let qr_result = super::print_setup_qr_code(token, &config, &updated);
+        assert!(qr_result.is_ok());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_create_temp_pairing_key_preserves_existing_secret_key() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let temp_dir = std::env::temp_dir().join(format!("test_pairing_dir_{}", nanoid::nanoid!()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let original_key_dir = std::env::var("ALOHOMORA_KEY_DIR").ok();
+        std::env::set_var("ALOHOMORA_KEY_DIR", &temp_dir);
+
+        let config = crate::config::AppConfig {
+            domain: "test.com".to_string(),
+            external_port: 12345,
+            internal_port: 12345,
+            web_service_url: "https://alohomora.app".to_string(),
+            use_relay: false,
+        };
+
+        let raw_local = [55u8; 32];
+        let local_key = super::secure_key_from_array(raw_local).unwrap();
+
+        let raw_secret = [123u8; 32];
+        let original_secret_key = super::secure_key_from_array(raw_secret).unwrap();
+
+        let identity = super::ServiceIdentity {
+            service_uuid: uuid::Uuid::new_v4().to_string(),
+            service_name: "Test Preserved Key".to_string(),
+        };
+
+        // 1. Create temp pairing key with existing secret_key
+        let pairing_token = super::create_temp_pairing_key(
+            &temp_dir,
+            &local_key,
+            &original_secret_key,
+            &config,
+            &identity,
+        )
+        .await
+        .unwrap();
+
+        // 2. Read temp secret key back and decrypt
+        let decrypted_secret = super::read_temp_secret_key(&pairing_token.value, &local_key)
+            .await
+            .unwrap();
+
+        // 3. Verify exactly matching original 32-byte secret key
+        decrypted_secret.unlock(|dec_bytes| {
+            original_secret_key.unlock(|orig_bytes| {
+                assert_eq!(dec_bytes, orig_bytes);
+            });
+        });
+
+        if let Some(val) = original_key_dir {
+            std::env::set_var("ALOHOMORA_KEY_DIR", val);
+        } else {
+            std::env::remove_var("ALOHOMORA_KEY_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
