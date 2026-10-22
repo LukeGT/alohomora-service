@@ -30,6 +30,10 @@ use crate::{
 pub struct KeychainInfo {
     pub domain: String,
     pub port: u16,
+    #[serde(default)]
+    pub service_uuid: Option<String>,
+    #[serde(default)]
+    pub service_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -216,6 +220,17 @@ pub async fn process_register_request(
         return Err(ApiError::bad_request(
             "only Android registrations are supported",
         ));
+    }
+
+    if let Some(ref req_su) = request.keychain.service_uuid {
+        if let Some(identity) = key_store::read_service_identity(&key_store::get_key_dir()).await? {
+            if req_su != &identity.service_uuid {
+                return Err(ApiError::bad_request(format!(
+                    "service_uuid mismatch: request specified {req_su}, but service is {}",
+                    identity.service_uuid
+                )));
+            }
+        }
     }
 
     let initialisation_token = request
@@ -867,5 +882,111 @@ mod tests {
         assert_eq!(completed[0]["message"], "simulated authorization failure");
 
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_register_request_with_service_uuid_validation() {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+        let temp_dir = std::env::temp_dir().join(format!("test_http_key_dir_{}", nanoid::nanoid!()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let original_key_dir = std::env::var("ALOHOMORA_KEY_DIR").ok();
+        std::env::set_var("ALOHOMORA_KEY_DIR", &temp_dir);
+
+        let my_identity = crate::key_store::ServiceIdentity {
+            service_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+            service_name: "Host Alpha".to_string(),
+        };
+        crate::key_store::write_service_identity(&temp_dir, &my_identity)
+            .await
+            .unwrap();
+
+        let local_key = crate::key_store::generate_random_secret_key().unwrap();
+        let secret_key = crate::key_store::generate_random_secret_key().unwrap();
+        let config = crate::config::AppConfig {
+            domain: "example.com".to_string(),
+            external_port: 443,
+            internal_port: 19969,
+            web_service_url: "https://alohomora.app".to_string(),
+            use_relay: false,
+        };
+
+        // Create a temp pairing key so token lookup works
+        let token = crate::key_store::create_temp_pairing_key(
+            &temp_dir,
+            &local_key,
+            &secret_key,
+            &config,
+            &my_identity,
+        )
+        .await
+        .unwrap();
+
+        let rsa_key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+        let spki = rsa::pkcs8::EncodePublicKey::to_public_key_der(&rsa_key.to_public_key()).unwrap();
+        let pub_key_b64 = BASE64.encode(spki.as_bytes());
+
+        let req_matching: super::RegisterRequest = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "device_uuid": "dev-123",
+            "keychain": {
+                "domain": "example.com",
+                "port": 443,
+                "service_uuid": "11111111-2222-3333-4444-555555555555",
+                "service_name": "Host Alpha"
+            },
+            "device_name": "Android Test",
+            "initialisation_token": token.value,
+            "public_key": {
+                "algorithm": "RSA-OAEP-256",
+                "format": "X.509 SubjectPublicKeyInfo",
+                "value_b64": pub_key_b64,
+                "parameters": {
+                    "digest": "SHA-256",
+                    "mgf": "MGF1",
+                    "mgf_digest": "SHA-256"
+                }
+            },
+            "fcm": {
+                "token": "fcm-tok"
+            },
+            "app": {
+                "package_name": "com.alohomora",
+                "version_name": "1.0",
+                "version_code": 1
+            },
+            "device": {
+                "os": "Android",
+                "sdk_int": 34,
+                "release": "14",
+                "manufacturer": "Google",
+                "model": "Pixel",
+                "product": "pixel"
+            },
+            "registered_at_ms": 123456789_i64
+        })).unwrap();
+
+        // 1. Mismatched service_uuid should fail with 400 Bad Request
+        let mut req_mismatched = req_matching.clone();
+        req_mismatched.keychain.service_uuid = Some("99999999-9999-9999-9999-999999999999".to_string());
+        let err = super::process_register_request(&local_key, req_mismatched)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("service_uuid mismatch"));
+
+        // 2. Matching service_uuid should succeed
+        let status = super::process_register_request(&local_key, req_matching)
+            .await
+            .unwrap();
+        assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
+
+        if let Some(val) = original_key_dir {
+            std::env::set_var("ALOHOMORA_KEY_DIR", val);
+        } else {
+            std::env::remove_var("ALOHOMORA_KEY_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

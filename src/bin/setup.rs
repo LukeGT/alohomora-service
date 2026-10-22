@@ -1,4 +1,4 @@
-use pass_secret_service::{config, key_store};
+use pass_secret_service::{auth_gate::AuthGate, config, http_server, key_store};
 use std::io::{self, Write};
 use std::process::ExitCode;
 
@@ -8,6 +8,10 @@ struct SetupArgs {
     /// clear existing setup state and secret store files
     #[argh(switch, long = "clear")]
     clear: bool,
+
+    /// friendly name for this Alohomora service
+    #[argh(option, long = "name")]
+    pub name: Option<String>,
 }
 
 fn confirm_clear() -> bool {
@@ -58,72 +62,128 @@ async fn main() -> ExitCode {
         }
     };
 
-    match key_store::run_setup(&config).await {
-        Ok(Some(pairing_token)) => {
-            let key_dir = key_store::get_key_dir();
-            let local_key_path = key_dir.join(key_store::LOCAL_KEY_FILE);
-            let local_key = match key_store::read_local_key(&local_key_path).await {
-                Ok(Some(key)) => key,
-                _ => {
-                    eprintln!("Error: local key not found after setup.");
-                    return ExitCode::FAILURE;
-                }
-            };
+    let (key_dir, local_key, service_identity) = match key_store::prepare_setup_keys(args.name).await {
+        Ok(keys) => keys,
+        Err(e) => {
+            eprintln!("Setup preparation error: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
 
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let done_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(tx)));
-            match pass_secret_service::http_server::spawn_setup_server(
-                config.clone(),
-                local_key.clone(),
-                done_tx.clone(),
-            )
-            .await
-            {
-                Ok(_server_handle) => {
-                    if config.use_relay {
-                        let done_tx = done_tx.clone();
-                        let local_key = local_key.clone();
-                        let web_service_url = config.web_service_url.clone();
-                        let session_id = pairing_token.id.clone();
-                        tokio::spawn(async move {
-                            let client = reqwest::Client::new();
-                            let res = pass_secret_service::http_server::poll_relay_once(
-                                &client,
-                                &web_service_url,
-                                "register",
-                                &session_id,
-                                std::time::Duration::from_secs(300),
-                                |req: pass_secret_service::http_server::RegisterRequest| async move {
-                                    pass_secret_service::http_server::process_register_request(
-                                        &local_key, req,
-                                    )
-                                    .await
-                                },
-                            )
-                            .await;
+    let has_devices = match key_store::has_registered_devices().await {
+        Ok(has) => has,
+        Err(e) => {
+            eprintln!("Error checking existing devices: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
 
-                            if let Ok(()) = res {
-                                if let Some(tx) = done_tx.lock().await.take() {
-                                    let _ = tx.send(());
-                                }
-                            }
-                        });
-                    }
-
-                    println!("Waiting for Android device registration...");
-                    let _ = rx.await;
-                    println!("Registration successful! Setup completed successfully.");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("Error starting registration server: {}", e);
-                    ExitCode::FAILURE
-                }
+    let secret_key = if !has_devices {
+        match key_store::generate_random_secret_key() {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Error generating secret key: {}", e);
+                return ExitCode::FAILURE;
             }
         }
-        Ok(None) => ExitCode::SUCCESS,
+    } else {
+        println!("Existing paired device(s) found. Please approve the authentication request on an existing device to unlock the secret key for pairing...");
+        let auth_gate = AuthGate::new(&config, local_key.clone());
+        let temp_http_server = if !config.use_relay {
+            match http_server::spawn(config.clone(), auth_gate.clone()).await {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    eprintln!("Error starting authentication server: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else {
+            None
+        };
+
+        let secret_key_res = auth_gate.request_secret_key(None).await;
+        if let Some(handle) = temp_http_server {
+            handle.abort();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        match secret_key_res {
+            Ok(k) => k,
+            Err(_) => {
+                eprintln!("Failed to authenticate with existing device. Aborting setup so existing secret key is not lost.");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    if let Err(e) = key_store::clear_temp_pairing_keys(&key_dir).await {
+        eprintln!("Error clearing temp pairing keys: {}", e);
+        return ExitCode::FAILURE;
+    }
+
+    let pairing_token = match key_store::create_temp_pairing_key(
+        &key_dir,
+        &local_key,
+        &secret_key,
+        &config,
+        &service_identity,
+    )
+    .await
+    {
+        Ok(token) => token,
         Err(e) => {
-            eprintln!("Setup error: {}", e);
+            eprintln!("Setup error creating pairing token: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let done_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(tx)));
+    match pass_secret_service::http_server::spawn_setup_server(
+        config.clone(),
+        local_key.clone(),
+        done_tx.clone(),
+    )
+    .await
+    {
+        Ok(_server_handle) => {
+            if config.use_relay {
+                let done_tx = done_tx.clone();
+                let local_key = local_key.clone();
+                let web_service_url = config.web_service_url.clone();
+                let session_id = pairing_token.id.clone();
+                tokio::spawn(async move {
+                    let client = reqwest::Client::new();
+                    let res = pass_secret_service::http_server::poll_relay_once(
+                        &client,
+                        &web_service_url,
+                        "register",
+                        &session_id,
+                        std::time::Duration::from_secs(300),
+                        |req: pass_secret_service::http_server::RegisterRequest| async move {
+                            pass_secret_service::http_server::process_register_request(
+                                &local_key, req,
+                            )
+                            .await
+                        },
+                    )
+                    .await;
+
+                    if let Ok(()) = res {
+                        if let Some(tx) = done_tx.lock().await.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                });
+            }
+
+            println!("Waiting for Android device registration...");
+            let _ = rx.await;
+            println!("Registration successful! Setup completed successfully.");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("Error starting registration server: {}", e);
             ExitCode::FAILURE
         }
     }
