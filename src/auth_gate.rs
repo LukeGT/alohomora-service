@@ -1,6 +1,7 @@
 use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use jiff::Timestamp;
 use log::{debug, info, warn};
 use rand::rngs::OsRng;
 use rsa::{pkcs8::EncodePublicKey, RsaPrivateKey};
@@ -154,6 +155,15 @@ impl AuthGate {
         &self,
         accessor: Option<&SecretAccessor<'_>>,
     ) -> Result<SecureKey> {
+        let default_accessor;
+        let accessor = match accessor {
+            Some(a) => a,
+            None => {
+                default_accessor = SecretAccessor::for_current_process();
+                &default_accessor
+            }
+        };
+
         let devices = key_store::list_android_device_auth_blobs().await?;
         if devices.is_empty() {
             warn!("Secret access requested but no Android devices are registered");
@@ -306,23 +316,15 @@ impl AuthGate {
                 self.inner.external_port.to_string()
             };
 
-            let payload = AndroidAuthPayload {
-                request_uuid: request_uuid_str.clone(),
+            let payload = Self::build_auth_payload(
+                &request_uuid_str,
                 encrypted_blob,
-                ephemeral_public_key: ephemeral_public_key_b64.clone(),
-                uid: accessor.map(|a| a.uid).unwrap_or_default().to_string(),
-                username: optional_string(accessor.and_then(|a| a.username.as_ref())),
-                pid: accessor.map(|a| a.pid).unwrap_or_default().to_string(),
-                process_name: optional_string(accessor.and_then(|a| a.process_name.as_ref())),
-                access_timestamp_ms: accessor
-                    .map(|a| a.timestamp)
-                    .unwrap_or_default()
-                    .to_string(),
-                domain: domain.clone(),
-                port: port.clone(),
-                service_uuid: service_identity.service_uuid.clone(),
-                service_name: service_identity.service_name.clone(),
-            };
+                ephemeral_public_key_b64.clone(),
+                accessor,
+                domain.clone(),
+                port.clone(),
+                &service_identity,
+            );
 
             let request_body = serde_json::json!({
                 "token": fcm_token,
@@ -433,6 +435,37 @@ impl AuthGate {
             .sender
             .send(secret_key)
             .map_err(|_| Error::InvalidRequest("authentication request is no longer active".into()))
+    }
+
+    fn build_auth_payload(
+        request_uuid: &str,
+        encrypted_blob: String,
+        ephemeral_public_key: String,
+        accessor: &SecretAccessor<'_>,
+        domain: String,
+        port: String,
+        service_identity: &key_store::ServiceIdentity,
+    ) -> AndroidAuthPayload {
+        let timestamp_ms = if accessor.timestamp > 0 {
+            accessor.timestamp
+        } else {
+            Timestamp::now().as_millisecond()
+        };
+
+        AndroidAuthPayload {
+            request_uuid: request_uuid.to_string(),
+            encrypted_blob,
+            ephemeral_public_key,
+            uid: accessor.uid.to_string(),
+            username: optional_string(accessor.username.as_ref()),
+            pid: accessor.pid.to_string(),
+            process_name: optional_string(accessor.process_name.as_ref()),
+            access_timestamp_ms: timestamp_ms.to_string(),
+            domain,
+            port,
+            service_uuid: service_identity.service_uuid.clone(),
+            service_name: service_identity.service_name.clone(),
+        }
     }
 }
 
@@ -707,5 +740,87 @@ mod tests {
             std::env::remove_var("ALOHOMORA_KEY_DIR");
         }
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_build_auth_payload_with_current_process_accessor() {
+        let accessor = SecretAccessor::for_current_process();
+        let service_identity = key_store::ServiceIdentity {
+            service_uuid: "svc-uuid-123".to_string(),
+            service_name: "My Host".to_string(),
+        };
+
+        let payload = AuthGate::build_auth_payload(
+            "req-uuid-1",
+            "blob".to_string(),
+            "pubkey".to_string(),
+            &accessor,
+            "example.com".to_string(),
+            "443".to_string(),
+            &service_identity,
+        );
+
+        assert_eq!(payload.request_uuid, "req-uuid-1");
+        assert_eq!(payload.pid, std::process::id().to_string());
+        assert_eq!(payload.uid, unsafe { libc::getuid() }.to_string());
+        assert!(!payload.username.is_empty());
+        assert!(!payload.process_name.is_empty());
+        let ts: i64 = payload.access_timestamp_ms.parse().unwrap();
+        assert!(ts > 0);
+        assert_eq!(payload.service_uuid, "svc-uuid-123");
+        assert_eq!(payload.service_name, "My Host");
+    }
+
+    #[test]
+    fn test_build_auth_payload_with_unknown_caller_accessor() {
+        let accessor = SecretAccessor::for_unknown_caller();
+        let service_identity = key_store::ServiceIdentity {
+            service_uuid: "svc-uuid-456".to_string(),
+            service_name: "My Host".to_string(),
+        };
+
+        let payload = AuthGate::build_auth_payload(
+            "req-uuid-2",
+            "blob".to_string(),
+            "pubkey".to_string(),
+            &accessor,
+            "example.com".to_string(),
+            "443".to_string(),
+            &service_identity,
+        );
+
+        assert_eq!(payload.request_uuid, "req-uuid-2");
+        assert_eq!(payload.pid, "0");
+        assert_eq!(payload.uid, "0");
+        assert!(payload.username.is_empty());
+        assert!(payload.process_name.is_empty());
+        let ts: i64 = payload.access_timestamp_ms.parse().unwrap();
+        assert!(ts > 0);
+    }
+
+    #[test]
+    fn test_build_auth_payload_with_zero_timestamp_falls_back_to_now() {
+        let accessor = SecretAccessor::default(); // default has timestamp 0
+        assert_eq!(accessor.timestamp, 0);
+
+        let service_identity = key_store::ServiceIdentity {
+            service_uuid: "svc-uuid-789".to_string(),
+            service_name: "My Host".to_string(),
+        };
+
+        let before = Timestamp::now().as_millisecond();
+        let payload = AuthGate::build_auth_payload(
+            "req-uuid-3",
+            "blob".to_string(),
+            "pubkey".to_string(),
+            &accessor,
+            "example.com".to_string(),
+            "443".to_string(),
+            &service_identity,
+        );
+        let after = Timestamp::now().as_millisecond();
+
+        let ts: i64 = payload.access_timestamp_ms.parse().unwrap();
+        assert!(ts >= before && ts <= after);
     }
 }

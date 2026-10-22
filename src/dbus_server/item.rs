@@ -92,6 +92,44 @@ fn username_from_uid(uid: u32) -> Option<String> {
 }
 
 impl SecretAccessor<'static> {
+    /// Create a SecretAccessor when caller details are unknown or missing (e.g. missing D-Bus sender header).
+    /// Timestamp is set to current time, but user and process information remain empty.
+    pub fn for_unknown_caller() -> Self {
+        Self {
+            dbus_name: Optional::from(None),
+            uid: 0,
+            username: Optional::from(None),
+            pid: 0,
+            process_name: Optional::from(None),
+            timestamp: Timestamp::now().as_millisecond(),
+        }
+    }
+
+    /// Create a SecretAccessor populated with the current process's identity and timestamp.
+    /// Used when the authentication request originates internally from Alohomora itself.
+    pub fn for_current_process() -> Self {
+        let pid = std::process::id();
+        let uid = unsafe { libc::getuid() };
+        let username = username_from_uid(uid);
+        let process_name = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .or_else(|| {
+                std::env::args()
+                    .next()
+                    .and_then(|a| std::path::Path::new(&a).file_name().map(|n| n.to_string_lossy().into_owned()))
+            });
+
+        Self {
+            dbus_name: Optional::from(None),
+            uid,
+            username: username.into(),
+            pid,
+            process_name: process_name.into(),
+            timestamp: Timestamp::now().as_millisecond(),
+        }
+    }
+
     /// Fetch data about a SecretAccessor given a unique name
     pub async fn from_dbus_name<'a>(
         connection: &Connection,
@@ -234,7 +272,7 @@ pub(crate) async fn access_info_from_header(
     if let Some(id) = header.sender() {
         Ok(Some(SecretAccessor::from_dbus_name(connection, id).await?))
     } else {
-        Ok(None)
+        Ok(Some(SecretAccessor::for_unknown_caller()))
     }
 }
 
@@ -456,5 +494,32 @@ impl Item<'static> {
             .stat_secret(&*self.collection_id, &*self.id)
             .await?;
         Ok(time_to_int(metadata.modified()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_secret_accessor_for_current_process() {
+        let accessor = SecretAccessor::for_current_process();
+        assert_eq!(accessor.pid, std::process::id());
+        assert_eq!(accessor.uid, unsafe { libc::getuid() });
+        assert!(accessor.timestamp > 0);
+        assert!(accessor.username.is_some());
+        assert!(accessor.process_name.is_some());
+        assert!(accessor.dbus_name.is_none());
+    }
+
+    #[test]
+    fn test_secret_accessor_for_unknown_caller() {
+        let accessor = SecretAccessor::for_unknown_caller();
+        assert_eq!(accessor.pid, 0);
+        assert_eq!(accessor.uid, 0);
+        assert!(accessor.timestamp > 0);
+        assert!(accessor.username.is_none());
+        assert!(accessor.process_name.is_none());
+        assert!(accessor.dbus_name.is_none());
     }
 }
