@@ -21,6 +21,8 @@ pub enum Error {
     ConfigError(String),
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
+    #[error("Invalid state: {0}")]
+    InvalidState(String),
     #[error("GPG Error: {0}")]
     GpgError(String),
     #[error("Pass is not initialized")]
@@ -45,6 +47,7 @@ impl DBusError for Error {
             Error::GpgError(e) => msg.build(&(e,)),
             Error::ConfigError(e) => msg.build(&(e,)),
             Error::InvalidRequest(e) => msg.build(&(e,)),
+            Error::InvalidState(e) => msg.build(&(e,)),
             _ => msg.build(&()),
         }
     }
@@ -60,6 +63,7 @@ impl DBusError for Error {
             Error::GpgError(_) => "me.grimsteel.PassSecretService.GPGError",
             Error::ConfigError(_) => "me.grimsteel.PassSecretService.ConfigError",
             Error::InvalidRequest(_) => "me.grimsteel.PassSecretService.InvalidRequest",
+            Error::InvalidState(_) => "me.grimsteel.PassSecretService.InvalidState",
             Error::EncryptionError(_) => "me.grimsteel.PassSecretService.EncryptionError",
             Error::NotInitialized => "me.grimsteel.PassSecretService.PassNotInitialized",
             Error::InvalidSession => "org.freedesktop.Secret.Error.NoSession",
@@ -75,6 +79,7 @@ impl DBusError for Error {
             Error::GpgError(e) => Some(e.as_str()),
             Error::ConfigError(e) => Some(e.as_str()),
             Error::InvalidRequest(e) => Some(e.as_str()),
+            Error::InvalidState(e) => Some(e.as_str()),
             _ => None,
         }
     }

@@ -161,7 +161,11 @@ impl AuthGate {
         }
 
         let key_dir = key_store::get_key_dir();
-        let service_identity = key_store::get_or_create_service_identity(&key_dir, None).await?;
+        let service_identity = key_store::read_service_identity(&key_dir)
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidState("service identity not initialized; run alohomora-setup".into())
+            })?;
 
         let request_uuid = Uuid::new_v4();
         let request_uuid_str = request_uuid.to_string();
@@ -659,5 +663,49 @@ mod tests {
             .complete_authentication(&request_uuid_str, &response_b64)
             .await;
         assert!(replay_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_request_secret_key_fails_when_service_identity_missing() {
+        let temp_dir = std::env::temp_dir().join(format!("test_auth_gate_no_id_{}", nanoid::nanoid!()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let original_key_dir = std::env::var("ALOHOMORA_KEY_DIR").ok();
+        std::env::set_var("ALOHOMORA_KEY_DIR", &temp_dir);
+
+        let mut raw_local_key = [17u8; 32];
+        let local_key = SecureKey::from_slice_mut(&mut raw_local_key).unwrap();
+        let config = AppConfig {
+            domain: "test.example.com".to_string(),
+            external_port: 443,
+            internal_port: 19969,
+            web_service_url: "https://alohomora.app".to_string(),
+            use_relay: false,
+        };
+        let auth_gate = AuthGate::new(&config, local_key.clone());
+
+        // Create a dummy registered device so devices.is_empty() passes
+        let dummy_blob = key_store::secure_blob_from_vec(vec![0u8; 84]).unwrap();
+        key_store::store_android_device_registration("dummy-dev-uuid", &dummy_blob, &dummy_blob)
+            .await
+            .unwrap();
+
+        let err = match auth_gate.request_secret_key(None).await {
+            Ok(_) => panic!("expected request_secret_key to fail, but it succeeded"),
+            Err(e) => e,
+        };
+        match err {
+            Error::InvalidState(msg) => {
+                assert_eq!(msg, "service identity not initialized; run alohomora-setup");
+            }
+            other => panic!("expected Error::InvalidState, got {:?}", other),
+        }
+
+        if let Some(val) = original_key_dir {
+            std::env::set_var("ALOHOMORA_KEY_DIR", val);
+        } else {
+            std::env::remove_var("ALOHOMORA_KEY_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
