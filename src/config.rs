@@ -20,17 +20,8 @@ impl AppConfig {
         let external_port = read_port_env("ALOHOMORA_EXTERNAL_PORT", 443)?;
         let internal_port = read_port_env("ALOHOMORA_INTERNAL_PORT", DEFAULT_PORT)?;
 
-        let web_service_url = env::var("ALOHOMORA_WEB_SERVICE_URL").unwrap_or_else(|_| {
-            if let Ok(notif_url) = env::var("ALOHOMORA_NOTIFICATION_URL") {
-                if let Some(stripped) = notif_url.strip_suffix("/send-notification") {
-                    stripped.to_string()
-                } else {
-                    notif_url
-                }
-            } else {
-                "https://alohomora.app".to_string()
-            }
-        });
+        let web_service_url = env::var("ALOHOMORA_WEB_SERVICE_URL")
+            .unwrap_or_else(|_| "https://alohomora.app".to_string());
 
         let use_relay = match env::var("ALOHOMORA_RELAY") {
             Ok(val) => {
@@ -180,14 +171,15 @@ mod tests {
             "http://custom-web.org:8080/send-notification"
         );
 
-        // Fallback from notification url by stripping /send-notification
+        // When ALOHOMORA_WEB_SERVICE_URL is unset, web_service_url defaults to
+        // https://alohomora.app without fallback stripping from ALOHOMORA_NOTIFICATION_URL
         env::remove_var("ALOHOMORA_WEB_SERVICE_URL");
         env::set_var(
             "ALOHOMORA_NOTIFICATION_URL",
             "https://relay.custom.org/send-notification",
         );
         let config = AppConfig::from_env().unwrap();
-        assert_eq!(config.web_service_url, "https://relay.custom.org");
+        assert_eq!(config.web_service_url, "https://alohomora.app");
         assert_eq!(
             config.notification_url(),
             "https://relay.custom.org/send-notification"

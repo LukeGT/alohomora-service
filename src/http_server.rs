@@ -30,10 +30,8 @@ use crate::{
 pub struct KeychainInfo {
     pub domain: String,
     pub port: u16,
-    #[serde(default)]
-    pub service_uuid: Option<String>,
-    #[serde(default)]
-    pub service_name: Option<String>,
+    pub service_uuid: String,
+    pub service_name: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -222,15 +220,17 @@ pub async fn process_register_request(
         ));
     }
 
-    if let Some(ref req_su) = request.keychain.service_uuid {
-        if let Some(identity) = key_store::read_service_identity(&key_store::get_key_dir()).await? {
-            if req_su != &identity.service_uuid {
-                return Err(ApiError::bad_request(format!(
-                    "service_uuid mismatch: request specified {req_su}, but service is {}",
-                    identity.service_uuid
-                )));
-            }
-        }
+    let identity = key_store::read_service_identity(&key_store::get_key_dir())
+        .await?
+        .ok_or_else(|| {
+            ApiError::internal("service identity not initialized; run alohomora-setup")
+        })?;
+
+    if request.keychain.service_uuid != identity.service_uuid {
+        return Err(ApiError::bad_request(format!(
+            "service_uuid mismatch: request specified {}, but service is {}",
+            request.keychain.service_uuid, identity.service_uuid
+        )));
     }
 
     let initialisation_token = request
@@ -282,6 +282,19 @@ pub async fn process_authenticate_request(
     auth_gate: &AuthGate,
     request: AuthenticateRequest,
 ) -> std::result::Result<StatusCode, ApiError> {
+    let identity = key_store::read_service_identity(&key_store::get_key_dir())
+        .await?
+        .ok_or_else(|| {
+            ApiError::internal("service identity not initialized; run alohomora-setup")
+        })?;
+
+    if request.keychain.service_uuid != identity.service_uuid {
+        return Err(ApiError::bad_request(format!(
+            "service_uuid mismatch: request specified {}, but service is {}",
+            request.keychain.service_uuid, identity.service_uuid
+        )));
+    }
+
     debug!(
         "Received authentication approval for request {} from {} on device {}",
         request.request_uuid, request.app.package_name, request.device_uuid
@@ -485,7 +498,9 @@ mod tests {
             "device_uuid": "f2018f87-e926-42a1-8b48-9ad4b7fd7cde",
             "keychain": {
               "domain": "example.com",
-              "port": 443
+              "port": 443,
+              "service_uuid": "11111111-2222-3333-4444-555555555555",
+              "service_name": "Host Alpha"
             },
             "device_name": "Pixel 9",
             "initialisation_token": "optional-token",
@@ -522,6 +537,11 @@ mod tests {
         assert_eq!(request.schema_version, 1);
         assert_eq!(request.device_uuid, "f2018f87-e926-42a1-8b48-9ad4b7fd7cde");
         assert_eq!(
+            request.keychain.service_uuid,
+            "11111111-2222-3333-4444-555555555555"
+        );
+        assert_eq!(request.keychain.service_name, "Host Alpha");
+        assert_eq!(
             request.initialisation_token.as_deref(),
             Some("optional-token")
         );
@@ -536,7 +556,9 @@ mod tests {
             "device_uuid": "f2018f87-e926-42a1-8b48-9ad4b7fd7cde",
             "keychain": {
               "domain": "example.com",
-              "port": 443
+              "port": 443,
+              "service_uuid": "11111111-2222-3333-4444-555555555555",
+              "service_name": "Host Alpha"
             },
             "decrypted_blob_b64": "base64-decrypted-blob",
             "app": {
@@ -551,6 +573,11 @@ mod tests {
         assert_eq!(request.schema_version, 1);
         assert_eq!(request.request_uuid, "6fbbce84-5aef-43c3-8cc7-469cbfd83109");
         assert_eq!(request.device_uuid, "f2018f87-e926-42a1-8b48-9ad4b7fd7cde");
+        assert_eq!(
+            request.keychain.service_uuid,
+            "11111111-2222-3333-4444-555555555555"
+        );
+        assert_eq!(request.keychain.service_name, "Host Alpha");
         assert_eq!(request.decrypted_blob_b64, "base64-decrypted-blob");
     }
 
@@ -647,7 +674,9 @@ mod tests {
             "device_uuid": "f2018f87-e926-42a1-8b48-9ad4b7fd7cde",
             "keychain": {
               "domain": "example.com",
-              "port": 443
+              "port": 443,
+              "service_uuid": "11111111-2222-3333-4444-555555555555",
+              "service_name": "Host Alpha"
             },
             "device_name": "Pixel 9",
             "initialisation_token": "optional-token",
@@ -745,7 +774,9 @@ mod tests {
             "device_uuid": "f2018f87-e926-42a1-8b48-9ad4b7fd7cde",
             "keychain": {
               "domain": "example.com",
-              "port": 443
+              "port": 443,
+              "service_uuid": "11111111-2222-3333-4444-555555555555",
+              "service_name": "Host Alpha"
             },
             "decrypted_blob_b64": "base64-decrypted-blob",
             "app": {
@@ -821,7 +852,9 @@ mod tests {
             "device_uuid": "f2018f87-e926-42a1-8b48-9ad4b7fd7cde",
             "keychain": {
               "domain": "example.com",
-              "port": 443
+              "port": 443,
+              "service_uuid": "11111111-2222-3333-4444-555555555555",
+              "service_name": "Host Alpha"
             },
             "decrypted_blob_b64": "base64-decrypted-blob",
             "app": {
@@ -969,7 +1002,7 @@ mod tests {
 
         // 1. Mismatched service_uuid should fail with 400 Bad Request
         let mut req_mismatched = req_matching.clone();
-        req_mismatched.keychain.service_uuid = Some("99999999-9999-9999-9999-999999999999".to_string());
+        req_mismatched.keychain.service_uuid = "99999999-9999-9999-9999-999999999999".to_string();
         let err = super::process_register_request(&local_key, req_mismatched)
             .await
             .unwrap_err();
@@ -977,10 +1010,106 @@ mod tests {
         assert!(err.message.contains("service_uuid mismatch"));
 
         // 2. Matching service_uuid should succeed
-        let status = super::process_register_request(&local_key, req_matching)
+        let status = super::process_register_request(&local_key, req_matching.clone())
             .await
             .unwrap();
         assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
+
+        // 3. Missing service identity should fail with 500 Internal Server Error
+        let empty_temp_dir = std::env::temp_dir().join(format!("test_http_key_dir_empty_{}", nanoid::nanoid!()));
+        std::fs::create_dir_all(&empty_temp_dir).unwrap();
+        std::env::set_var("ALOHOMORA_KEY_DIR", &empty_temp_dir);
+
+        let err = super::process_register_request(&local_key, req_matching)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            err.message,
+            "service identity not initialized; run alohomora-setup"
+        );
+        let _ = std::fs::remove_dir_all(&empty_temp_dir);
+
+        if let Some(val) = original_key_dir {
+            std::env::set_var("ALOHOMORA_KEY_DIR", val);
+        } else {
+            std::env::remove_var("ALOHOMORA_KEY_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_request_with_service_uuid_validation() {
+        let temp_dir = std::env::temp_dir().join(format!("test_http_auth_key_dir_{}", nanoid::nanoid!()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let original_key_dir = std::env::var("ALOHOMORA_KEY_DIR").ok();
+        std::env::set_var("ALOHOMORA_KEY_DIR", &temp_dir);
+
+        let local_key = crate::key_store::generate_random_secret_key().unwrap();
+        let config = crate::config::AppConfig {
+            domain: "example.com".to_string(),
+            external_port: 443,
+            internal_port: 19969,
+            web_service_url: "https://alohomora.app".to_string(),
+            use_relay: false,
+        };
+        let auth_gate = crate::auth_gate::AuthGate::new(&config, local_key);
+
+        let req: super::AuthenticateRequest = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "request_uuid": "6fbbce84-5aef-43c3-8cc7-469cbfd83109",
+            "device_uuid": "f2018f87-e926-42a1-8b48-9ad4b7fd7cde",
+            "keychain": {
+                "domain": "example.com",
+                "port": 443,
+                "service_uuid": "11111111-2222-3333-4444-555555555555",
+                "service_name": "Host Alpha"
+            },
+            "decrypted_blob_b64": "base64-decrypted-blob",
+            "app": {
+                "package_name": "com.alohomora.app",
+                "version_name": "0.1.0",
+                "version_code": 1
+            },
+            "approved_at_ms": 1760000000123_i64
+        })).unwrap();
+
+        // 1. Missing service identity should fail with 500 Internal Server Error
+        let err = super::process_authenticate_request(&auth_gate, req.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            err.message,
+            "service identity not initialized; run alohomora-setup"
+        );
+
+        // 2. Write service identity with different service_uuid
+        let my_identity = crate::key_store::ServiceIdentity {
+            service_uuid: "22222222-3333-4444-5555-666666666666".to_string(),
+            service_name: "Host Beta".to_string(),
+        };
+        crate::key_store::write_service_identity(&temp_dir, &my_identity)
+            .await
+            .unwrap();
+
+        // Mismatched service_uuid should fail with 400 Bad Request
+        let err = super::process_authenticate_request(&auth_gate, req.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("service_uuid mismatch"));
+
+        // 3. Matching service_uuid should pass service identity validation and proceed to auth_gate
+        let mut req_matching = req.clone();
+        req_matching.keychain.service_uuid = "22222222-3333-4444-5555-666666666666".to_string();
+        let err = super::process_authenticate_request(&auth_gate, req_matching)
+            .await
+            .unwrap_err();
+        // Since no pending auth request was registered with auth_gate, it returns "no pending authentication request"
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "no pending authentication request");
 
         if let Some(val) = original_key_dir {
             std::env::set_var("ALOHOMORA_KEY_DIR", val);
