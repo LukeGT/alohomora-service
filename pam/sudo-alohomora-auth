@@ -1,0 +1,61 @@
+#!/bin/bash
+set -u
+
+TARGET_USER="${PAM_USER:-ubuntu}"
+TARGET_UID="$(id -u "$TARGET_USER" 2>/dev/null || echo 1000)"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${TARGET_UID}/bus"
+
+# Fall back immediately to password if Alohomora service is inactive
+if ! systemctl is-active --quiet alohomora-service; then
+    exit 1
+fi
+
+# Run the secret lookup in background as the invoking user
+/usr/local/bin/sudo-auth lookup service sudo >/dev/null 2>&1 &
+SECRET_PID=$!
+
+# Ensure background lookup is cleaned up on script exit
+trap 'kill "$SECRET_PID" 2>/dev/null; wait "$SECRET_PID" 2>/dev/null' EXIT INT TERM
+
+# Identify the user's terminal (PAM passes PAM_TTY to pam_exec)
+TTY_DEV=""
+if [ -n "${PAM_TTY:-}" ]; then
+    if [[ "$PAM_TTY" == /* ]]; then
+        TTY_DEV="$PAM_TTY"
+    else
+        TTY_DEV="/dev/$PAM_TTY"
+    fi
+fi
+
+if [ -z "$TTY_DEV" ] || [[ ! "$TTY_DEV" =~ ^/dev/(pts/[0-9]+|tty[0-9a-zA-Z]*)$ ]]; then
+    PPID_FD0=$(readlink -f "/proc/$PPID/fd/0" 2>/dev/null || true)
+    if [[ "$PPID_FD0" =~ ^/dev/(pts/[0-9]+|tty[0-9a-zA-Z]*)$ ]]; then
+        TTY_DEV="$PPID_FD0"
+    fi
+fi
+
+# If a valid terminal is available and accessible, prompt and monitor Enter key
+if [ -n "$TTY_DEV" ] && [ -r "$TTY_DEV" ] && [ -w "$TTY_DEV" ]; then
+    printf "Alohomora push sent. Press Enter for password: " > "$TTY_DEV"
+    while kill -0 "$SECRET_PID" 2>/dev/null; do
+        if read -t 0.2 -r _ < "$TTY_DEV" 2>/dev/null; then
+            # User pressed Enter: abort push and drop to password prompt
+            kill "$SECRET_PID" 2>/dev/null
+            wait "$SECRET_PID" 2>/dev/null
+            printf "\n" > "$TTY_DEV"
+            exit 1
+        fi
+    done
+fi
+
+wait "$SECRET_PID" 2>/dev/null
+STATUS=$?
+
+if [ $STATUS -eq 0 ]; then
+    if [ -n "$TTY_DEV" ] && [ -w "$TTY_DEV" ]; then
+        printf "\n" > "$TTY_DEV"
+    fi
+    exit 0
+else
+    exit 1
+fi
