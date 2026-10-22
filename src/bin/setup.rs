@@ -139,52 +139,57 @@ async fn main() -> ExitCode {
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     let done_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(tx)));
-    match pass_secret_service::http_server::spawn_setup_server(
+    let _server_handle = match pass_secret_service::http_server::spawn_setup_server(
         config.clone(),
         local_key.clone(),
         done_tx.clone(),
     )
     .await
     {
-        Ok(_server_handle) => {
-            if config.use_relay {
-                let done_tx = done_tx.clone();
-                let local_key = local_key.clone();
-                let web_service_url = config.web_service_url.clone();
-                let session_id = pairing_token.id.clone();
-                tokio::spawn(async move {
-                    let client = reqwest::Client::new();
-                    let res = pass_secret_service::http_server::poll_relay_once(
-                        &client,
-                        &web_service_url,
-                        "register",
-                        &session_id,
-                        std::time::Duration::from_secs(300),
-                        |req: pass_secret_service::http_server::RegisterRequest| async move {
-                            pass_secret_service::http_server::process_register_request(
-                                &local_key, req,
-                            )
-                            .await
-                        },
-                    )
-                    .await;
-
-                    if let Ok(()) = res {
-                        if let Some(tx) = done_tx.lock().await.take() {
-                            let _ = tx.send(());
-                        }
-                    }
-                });
-            }
-
-            println!("Waiting for Android device registration...");
-            let _ = rx.await;
-            println!("Registration successful! Setup completed successfully.");
-            ExitCode::SUCCESS
-        }
+        Ok(handle) => Some(handle),
         Err(e) => {
-            eprintln!("Error starting registration server: {}", e);
-            ExitCode::FAILURE
+            if config.use_relay {
+                eprintln!("Direct HTTP server not bound ({e}); proceeding with public relay");
+                None
+            } else {
+                eprintln!("Error starting registration server: {}", e);
+                return ExitCode::FAILURE;
+            }
         }
+    };
+
+    if config.use_relay {
+        let done_tx = done_tx.clone();
+        let local_key = local_key.clone();
+        let web_service_url = config.web_service_url.clone();
+        let session_id = pairing_token.id.clone();
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let res = pass_secret_service::http_server::poll_relay_once(
+                &client,
+                &web_service_url,
+                "register",
+                &session_id,
+                std::time::Duration::from_secs(300),
+                |req: pass_secret_service::http_server::RegisterRequest| async move {
+                    pass_secret_service::http_server::process_register_request(
+                        &local_key, req,
+                    )
+                    .await
+                },
+            )
+            .await;
+
+            if let Ok(()) = res {
+                if let Some(tx) = done_tx.lock().await.take() {
+                    let _ = tx.send(());
+                }
+            }
+        });
     }
+
+    println!("Waiting for Android device registration...");
+    let _ = rx.await;
+    println!("Registration successful! Setup completed successfully.");
+    ExitCode::SUCCESS
 }
