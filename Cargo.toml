@@ -66,3 +66,10 @@ zbus = { version = "4.3.1", default-features = false, features = ["tokio"] }
 strip = true
 opt-level = "z"
 lto = true
+
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.dev.package."*"]
+debug = 0
