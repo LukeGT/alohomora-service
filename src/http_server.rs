@@ -4,10 +4,10 @@ use std::{
 };
 
 use axum::{
-    extract::State,
-    http::StatusCode,
+    extract::{ConnectInfo, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, task::JoinHandle};
 
 use crate::{
-    auth_gate::AuthGate,
+    auth_gate::{AuthGate, LocalChallenge},
     config::AppConfig,
     error::{Error, Result},
     key_store::{self, SecureBlob},
@@ -86,7 +86,9 @@ pub struct RegisterRequest {
     #[serde(default)]
     pub initialisation_token: Option<String>,
     pub public_key: PublicKeyInfo,
-    pub fcm: FcmInfo,
+    /// Required for Android devices; absent for local (virtual) devices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fcm: Option<FcmInfo>,
     pub app: AppInfo,
     pub device: DeviceInfo,
     pub registered_at_ms: i64,
@@ -166,15 +168,51 @@ pub async fn spawn(config: AppConfig, auth_gate: AuthGate) -> Result<JoinHandle<
         addr, config.domain, config.external_port
     );
 
-    let app = Router::new()
-        .route("/alohomora/authenticate", post(authenticate))
-        .with_state(ApiState { auth_gate });
+    let app = router(auth_gate);
 
     Ok(tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, app).await {
+        if let Err(err) = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        {
             error!("Alohomora HTTP server failed: {err}");
         }
     }))
+}
+
+pub fn router(auth_gate: AuthGate) -> Router {
+    Router::new()
+        .route("/alohomora/authenticate", post(authenticate))
+        .route("/alohomora/local/challenges", get(local_challenges))
+        .with_state(ApiState { auth_gate })
+}
+
+/// Local challenges are only served to direct loopback peers. Any proxy header
+/// means the request may have been forwarded (e.g. by a relay running on this
+/// host), so it is refused.
+pub fn check_local_challenge_request(
+    peer: &SocketAddr,
+    headers: &HeaderMap,
+) -> std::result::Result<(), ApiError> {
+    const FORWARDING_HEADERS: [&str; 4] = ["x-forwarded-for", "forwarded", "x-real-ip", "via"];
+    if !peer.ip().is_loopback() || FORWARDING_HEADERS.iter().any(|h| headers.contains_key(*h)) {
+        return Err(ApiError {
+            status: StatusCode::FORBIDDEN,
+            message: "local challenges are only available to direct loopback clients".into(),
+        });
+    }
+    Ok(())
+}
+
+async fn local_challenges(
+    State(state): State<ApiState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<Vec<LocalChallenge>>, ApiError> {
+    check_local_challenge_request(&peer, &headers)?;
+    Ok(Json(state.auth_gate.pending_local_challenges().await))
 }
 
 pub async fn spawn_setup_server(
@@ -214,11 +252,29 @@ pub async fn process_register_request(
         request.device.model
     );
 
-    if request.device.os != "Android" {
-        return Err(ApiError::bad_request(
-            "only Android registrations are supported",
-        ));
-    }
+    let kind = match request.device.os.as_str() {
+        "Android" => {
+            if request
+                .fcm
+                .as_ref()
+                .map_or(true, |fcm| fcm.token.is_empty())
+            {
+                return Err(ApiError::bad_request("fcm.token is required for Android"));
+            }
+            key_store::DeviceKind::Android
+        }
+        "Local" => {
+            if uuid::Uuid::parse_str(&request.device_uuid).is_err() {
+                return Err(ApiError::bad_request("device_uuid must be a UUID"));
+            }
+            key_store::DeviceKind::Local
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "only Android and Local registrations are supported",
+            ));
+        }
+    };
 
     let identity = key_store::read_service_identity(&key_store::get_key_dir())
         .await?
@@ -248,7 +304,8 @@ pub async fn process_register_request(
         .map_err(|err| ApiError::internal(format!("failed to serialize registration: {err}")))?;
     let encrypted_registration = key_store::encrypt_aes256_gcm(local_key, &registration_json)?;
 
-    key_store::store_android_device_registration(
+    key_store::store_device_registration(
+        kind,
         &request.device_uuid,
         &encrypted_registration,
         &locally_encrypted_secret_key,
@@ -258,8 +315,11 @@ pub async fn process_register_request(
     key_store::remove_temp_pairing_key(initialisation_token).await?;
 
     info!(
-        "Registered Android device {} at device-keys/android/{}",
-        request.device.model, request.device_uuid
+        "Registered {:?} device {} at device-keys/{}/{}",
+        kind,
+        request.device.model,
+        kind.dir_name(),
+        request.device_uuid
     );
 
     Ok(StatusCode::NO_CONTENT)
@@ -299,9 +359,24 @@ pub async fn process_authenticate_request(
         "Received authentication approval for request {} from {} on device {}",
         request.request_uuid, request.app.package_name, request.device_uuid
     );
+    let local_challenge = auth_gate
+        .find_local_challenge(&request.request_uuid, &request.device_uuid)
+        .await;
     auth_gate
         .complete_authentication(&request.request_uuid, &request.decrypted_blob_b64)
         .await?;
+    if let Some(challenge) = local_challenge {
+        info!(
+            "Local device unlock approved: device {} ({}), request {}, requested by uid={} user={} pid={} process={}",
+            challenge.device_uuid,
+            challenge.device_name,
+            challenge.request_uuid,
+            challenge.uid,
+            challenge.username,
+            challenge.pid,
+            challenge.process_name,
+        );
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -921,7 +996,8 @@ mod tests {
     async fn test_register_request_with_service_uuid_validation() {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
-        let temp_dir = std::env::temp_dir().join(format!("test_http_key_dir_{}", nanoid::nanoid!()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("test_http_key_dir_{}", nanoid::nanoid!()));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let original_key_dir = std::env::var("ALOHOMORA_KEY_DIR").ok();
@@ -957,7 +1033,8 @@ mod tests {
         .unwrap();
 
         let rsa_key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
-        let spki = rsa::pkcs8::EncodePublicKey::to_public_key_der(&rsa_key.to_public_key()).unwrap();
+        let spki =
+            rsa::pkcs8::EncodePublicKey::to_public_key_der(&rsa_key.to_public_key()).unwrap();
         let pub_key_b64 = BASE64.encode(spki.as_bytes());
 
         let req_matching: super::RegisterRequest = serde_json::from_value(serde_json::json!({
@@ -998,7 +1075,8 @@ mod tests {
                 "product": "pixel"
             },
             "registered_at_ms": 123456789_i64
-        })).unwrap();
+        }))
+        .unwrap();
 
         // 1. Mismatched service_uuid should fail with 400 Bad Request
         let mut req_mismatched = req_matching.clone();
@@ -1016,7 +1094,8 @@ mod tests {
         assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
 
         // 3. Missing service identity should fail with 500 Internal Server Error
-        let empty_temp_dir = std::env::temp_dir().join(format!("test_http_key_dir_empty_{}", nanoid::nanoid!()));
+        let empty_temp_dir =
+            std::env::temp_dir().join(format!("test_http_key_dir_empty_{}", nanoid::nanoid!()));
         std::fs::create_dir_all(&empty_temp_dir).unwrap();
         std::env::set_var("ALOHOMORA_KEY_DIR", &empty_temp_dir);
 
@@ -1040,7 +1119,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_authenticate_request_with_service_uuid_validation() {
-        let temp_dir = std::env::temp_dir().join(format!("test_http_auth_key_dir_{}", nanoid::nanoid!()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("test_http_auth_key_dir_{}", nanoid::nanoid!()));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let original_key_dir = std::env::var("ALOHOMORA_KEY_DIR").ok();
@@ -1073,7 +1153,8 @@ mod tests {
                 "version_code": 1
             },
             "approved_at_ms": 1760000000123_i64
-        })).unwrap();
+        }))
+        .unwrap();
 
         // 1. Missing service identity should fail with 500 Internal Server Error
         let err = super::process_authenticate_request(&auth_gate, req.clone())

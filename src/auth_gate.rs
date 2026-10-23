@@ -5,7 +5,7 @@ use jiff::Timestamp;
 use log::{debug, info, warn};
 use rand::rngs::OsRng;
 use rsa::{pkcs8::EncodePublicKey, RsaPrivateKey};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -114,6 +114,29 @@ struct AuthGateInner {
     notification_url: String,
     use_relay: bool,
     pending: Mutex<HashMap<String, PendingAuth>>,
+    /// Challenges for local (virtual) devices, keyed by request uuid. These are
+    /// never sent anywhere; the local unlock tool fetches them over loopback.
+    local_challenges: Mutex<HashMap<String, Vec<LocalChallenge>>>,
+}
+
+/// A pending challenge for a local device, as served by
+/// `GET /alohomora/local/challenges`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalChallenge {
+    pub request_uuid: String,
+    pub device_uuid: String,
+    pub device_name: String,
+    pub encrypted_blob: String,
+    pub ephemeral_public_key: String,
+    pub uid: String,
+    pub username: String,
+    pub pid: String,
+    pub process_name: String,
+    pub access_timestamp_ms: String,
+    pub domain: String,
+    pub port: String,
+    pub service_uuid: String,
+    pub service_name: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,12 +166,31 @@ impl AuthGate {
                 notification_url: config.notification_url(),
                 use_relay: config.use_relay,
                 pending: Mutex::new(HashMap::new()),
+                local_challenges: Mutex::new(HashMap::new()),
             }),
         }
     }
 
     pub fn local_key(&self) -> &SecureKey {
         &self.inner.local_key
+    }
+
+    pub async fn pending_local_challenges(&self) -> Vec<LocalChallenge> {
+        let challenges = self.inner.local_challenges.lock().await;
+        challenges.values().flatten().cloned().collect()
+    }
+
+    pub async fn find_local_challenge(
+        &self,
+        request_uuid: &str,
+        device_uuid: &str,
+    ) -> Option<LocalChallenge> {
+        let challenges = self.inner.local_challenges.lock().await;
+        challenges
+            .get(request_uuid)?
+            .iter()
+            .find(|c| c.device_uuid == device_uuid)
+            .cloned()
     }
 
     pub async fn request_secret_key(
@@ -228,7 +270,8 @@ impl AuthGate {
 
         for device in devices {
             // Decrypt the device registration to retrieve the FCM token and public key
-            let registration = match key_store::read_android_device_registration(
+            let registration = match key_store::read_device_registration(
+                device.kind,
                 &device.device_uuid,
                 &self.inner.local_key,
             )
@@ -239,17 +282,6 @@ impl AuthGate {
                     warn!(
                         "Failed to read registration for device {}: {}",
                         device.device_uuid, err
-                    );
-                    continue;
-                }
-            };
-
-            let fcm_token = match registration["fcm"]["token"].as_str() {
-                Some(t) => t.to_string(),
-                None => {
-                    warn!(
-                        "FCM token not found in registration for device {}",
-                        device.device_uuid
                     );
                     continue;
                 }
@@ -310,7 +342,10 @@ impl AuthGate {
 
             let port = if let Some(p) = registration["keychain"]["port"].as_u64() {
                 p.to_string()
-            } else if let Some(p) = registration["keychain"]["port"].as_str().filter(|s| !s.is_empty()) {
+            } else if let Some(p) = registration["keychain"]["port"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+            {
                 p.to_string()
             } else {
                 self.inner.external_port.to_string()
@@ -325,6 +360,53 @@ impl AuthGate {
                 port.clone(),
                 &service_identity,
             );
+
+            if device.kind == key_store::DeviceKind::Local {
+                // Local devices get no push notification: park the challenge
+                // for the loopback-only local unlock tool.
+                let device_name = registration["device_name"]
+                    .as_str()
+                    .unwrap_or("local device")
+                    .to_string();
+                info!(
+                    "Parking challenge for local device {} ({}), request {}",
+                    device.device_uuid, device_name, request_uuid_str
+                );
+                self.inner
+                    .local_challenges
+                    .lock()
+                    .await
+                    .entry(request_uuid_str.clone())
+                    .or_default()
+                    .push(LocalChallenge {
+                        request_uuid: payload.request_uuid,
+                        device_uuid: device.device_uuid.clone(),
+                        device_name,
+                        encrypted_blob: payload.encrypted_blob,
+                        ephemeral_public_key: payload.ephemeral_public_key,
+                        uid: payload.uid,
+                        username: payload.username,
+                        pid: payload.pid,
+                        process_name: payload.process_name,
+                        access_timestamp_ms: payload.access_timestamp_ms,
+                        domain: payload.domain,
+                        port: payload.port,
+                        service_uuid: payload.service_uuid,
+                        service_name: payload.service_name,
+                    });
+                continue;
+            }
+
+            let fcm_token = match registration["fcm"]["token"].as_str() {
+                Some(t) => t.to_string(),
+                None => {
+                    warn!(
+                        "FCM token not found in registration for device {}",
+                        device.device_uuid
+                    );
+                    continue;
+                }
+            };
 
             let request_body = serde_json::json!({
                 "token": fcm_token,
@@ -376,7 +458,13 @@ impl AuthGate {
             }
         }
 
-        match time::timeout(AUTHORIZATION_TIMEOUT, receiver).await {
+        let outcome = time::timeout(AUTHORIZATION_TIMEOUT, receiver).await;
+        self.inner
+            .local_challenges
+            .lock()
+            .await
+            .remove(&request_uuid_str);
+        match outcome {
             Ok(Ok(secret_key)) => {
                 debug!("Authentication gate opened for request {request_uuid_str}");
                 Ok(secret_key)
@@ -398,6 +486,11 @@ impl AuthGate {
         request_uuid: &str,
         decrypted_blob_b64: &str,
     ) -> Result {
+        self.inner
+            .local_challenges
+            .lock()
+            .await
+            .remove(request_uuid);
         let pending = self
             .inner
             .pending
@@ -700,7 +793,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_secret_key_fails_when_service_identity_missing() {
-        let temp_dir = std::env::temp_dir().join(format!("test_auth_gate_no_id_{}", nanoid::nanoid!()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("test_auth_gate_no_id_{}", nanoid::nanoid!()));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let original_key_dir = std::env::var("ALOHOMORA_KEY_DIR").ok();

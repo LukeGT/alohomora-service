@@ -15,10 +15,19 @@ path = "src/main.rs"
 name = "alohomora-setup"
 path = "src/bin/setup.rs"
 
+[[bin]]
+name = "alohomora-local-device"
+path = "src/bin/local_device.rs"
+
+[[bin]]
+name = "alohomora-unlock"
+path = "src/bin/unlock.rs"
+
 [dependencies]
 aes = "0.8.4"
 aes-gcm = "0.10.3"
 argh = "0.1.13"
+argon2 = "0.5"
 async-trait = "0.1.89"
 axum = { version = "0.7.9", default-features = false, features = ["http1", "json", "tokio"] }
 base64 = "0.22.1"
@@ -38,6 +47,7 @@ rand = "0.8.5"
 qrcode = { version = "0.14.1", default-features = false }
 redb = "2.1.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rpassword = "7"
 rsa = { version = "0.9.10", features = ["sha2"] }
 schemars = "0.8.22"
 secure-types = { version = "0.2.40", features = ["serde"] }
@@ -48,6 +58,7 @@ sha2 = "0.10.9"
 sysinfo = { version = "0.38.0", default-features = false, features = ["system"] }
 thiserror = "2.0.12"
 tokio = { version = "1.38.1", features = ["fs", "rt", "rt-multi-thread", "macros", "net", "process", "sync", "time"] }
+zeroize = "1"
 uuid = { version = "1.11.0", features = ["v4"] }
 zbus = { version = "4.3.1", default-features = false, features = ["tokio"] }
 

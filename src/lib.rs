@@ -23,6 +23,7 @@ pub mod dbus_server;
 pub mod error;
 pub mod http_server;
 pub mod key_store;
+pub mod local_device;
 pub mod pass;
 pub mod secret_store;
 
