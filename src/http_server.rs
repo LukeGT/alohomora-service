@@ -1019,6 +1019,7 @@ mod tests {
             internal_port: 19969,
             web_service_url: "https://alohomora.app".to_string(),
             use_relay: false,
+            authorization_timeout: std::time::Duration::from_secs(60),
         };
 
         // Create a temp pairing key so token lookup works
@@ -1133,6 +1134,7 @@ mod tests {
             internal_port: 19969,
             web_service_url: "https://alohomora.app".to_string(),
             use_relay: false,
+            authorization_timeout: std::time::Duration::from_secs(60),
         };
         let auth_gate = crate::auth_gate::AuthGate::new(&config, local_key);
 

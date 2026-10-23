@@ -861,6 +861,7 @@ mod tests {
             internal_port: 12345,
             web_service_url: "https://alohomora.app".to_string(),
             use_relay: false,
+            authorization_timeout: std::time::Duration::from_secs(60),
         };
 
         let result = super::initialize(&config).await;
@@ -896,6 +897,7 @@ mod tests {
             internal_port: 12345,
             web_service_url: "https://alohomora.app".to_string(),
             use_relay: false,
+            authorization_timeout: std::time::Duration::from_secs(60),
         };
 
         // 1. Initially, initialize should fail because pairing keys don't exist yet
@@ -1042,6 +1044,7 @@ mod tests {
             internal_port: 19969,
             web_service_url: "https://alohomora.app".to_string(),
             use_relay: true,
+            authorization_timeout: std::time::Duration::from_secs(60),
         };
         let token = "alohomora-testtoken1-1234567890";
         let expected_url = format!(
@@ -1074,6 +1077,7 @@ mod tests {
             internal_port: 12345,
             web_service_url: "https://alohomora.app".to_string(),
             use_relay: false,
+            authorization_timeout: std::time::Duration::from_secs(60),
         };
 
         let raw_local = [55u8; 32];

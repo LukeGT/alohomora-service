@@ -1,5 +1,5 @@
-use std::process::ExitCode;
 use pass_secret_service::{cli, run};
+use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {

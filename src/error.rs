@@ -74,7 +74,9 @@ impl DBusError for Error {
 
     fn description(&self) -> Option<&str> {
         match self {
-            Error::SetupIncomplete => Some("Setup has not been completed. Please run the alohomora-setup executable."),
+            Error::SetupIncomplete => {
+                Some("Setup has not been completed. Please run the alohomora-setup executable.")
+            }
             Error::DbusError(zbus::Error::MethodError(_, desc, _)) => desc.as_deref(),
             Error::GpgError(e) => Some(e.as_str()),
             Error::ConfigError(e) => Some(e.as_str()),

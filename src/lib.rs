@@ -39,6 +39,10 @@ pub async fn run(args: CliArgs) -> Result {
             let config = config::AppConfig::from_env()?;
             let startup_keys = key_store::initialize(&config).await?;
             let symmetric_gpg_passphrase = key_store::key_to_passphrase(&startup_keys.local_key);
+            info!(
+                "Authorization timeout: {}s",
+                config.authorization_timeout.as_secs()
+            );
             let auth_gate = AuthGate::new(&config, startup_keys.local_key);
             let pass = Box::leak(Box::new(PasswordStore::from_env(
                 args.password_store_dir.map(|d| d.into()),

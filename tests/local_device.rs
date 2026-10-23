@@ -52,6 +52,7 @@ async fn local_device_register_unlock_round_trip() {
         internal_port: 19969,
         web_service_url: format!("http://{mock_addr}"),
         use_relay: false,
+        authorization_timeout: std::time::Duration::from_secs(60),
     };
     let identity = ServiceIdentity {
         service_uuid: Uuid::new_v4().to_string(),

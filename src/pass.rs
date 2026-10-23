@@ -138,7 +138,11 @@ impl PasswordStore {
             .await
     }
 
-    async fn encrypt_with_passphrase(&self, value: &[u8], passphrase: &SecureString) -> Result<Vec<u8>> {
+    async fn encrypt_with_passphrase(
+        &self,
+        value: &[u8],
+        passphrase: &SecureString,
+    ) -> Result<Vec<u8>> {
         let mut command = self.make_gpg_process();
         Self::add_symmetric_passphrase_args_with(&mut command, passphrase);
 
@@ -163,7 +167,11 @@ impl PasswordStore {
         }
     }
 
-    async fn decrypt_with_passphrase(&self, encrypted_data: &[u8], passphrase: &SecureString) -> Result<Vec<u8>> {
+    async fn decrypt_with_passphrase(
+        &self,
+        encrypted_data: &[u8],
+        passphrase: &SecureString,
+    ) -> Result<Vec<u8>> {
         let mut command = self.make_gpg_process();
         Self::add_symmetric_passphrase_args_with(&mut command, passphrase);
 
@@ -190,11 +198,15 @@ impl PasswordStore {
         key: &SecureKey,
     ) -> Result<Vec<u8>> {
         // 1. Decrypt outer layer using local_key (self.symmetric_gpg_passphrase)
-        let outer_decrypted = self.read_password_with_passphrase(path, &self.symmetric_gpg_passphrase).await?;
+        let outer_decrypted = self
+            .read_password_with_passphrase(path, &self.symmetric_gpg_passphrase)
+            .await?;
 
         // 2. Decrypt inner layer using secret_key
         let secret_passphrase = key_store::key_to_passphrase(key);
-        let inner_decrypted = self.decrypt_with_passphrase(&outer_decrypted, &secret_passphrase).await?;
+        let inner_decrypted = self
+            .decrypt_with_passphrase(&outer_decrypted, &secret_passphrase)
+            .await?;
 
         Ok(inner_decrypted)
     }
@@ -253,10 +265,14 @@ impl PasswordStore {
 
         // 1. Encrypt with secret_key first
         let secret_passphrase = key_store::key_to_passphrase(key);
-        let inner_encrypted = self.encrypt_with_passphrase(&value, &secret_passphrase).await?;
+        let inner_encrypted = self
+            .encrypt_with_passphrase(&value, &secret_passphrase)
+            .await?;
 
         // 2. Encrypt with local_key
-        let outer_encrypted = self.encrypt_with_passphrase(&inner_encrypted, &self.symmetric_gpg_passphrase).await?;
+        let outer_encrypted = self
+            .encrypt_with_passphrase(&inner_encrypted, &self.symmetric_gpg_passphrase)
+            .await?;
 
         let mut file = OpenOptions::new()
             .write(true)
@@ -475,4 +491,3 @@ mod tests {
         let _ = remove_dir_all(&temp_dir).await;
     }
 }
-

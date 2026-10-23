@@ -438,6 +438,7 @@ mod tests {
             internal_port: 19969,
             web_service_url: "https://alohomora.app".into(),
             use_relay: false,
+            authorization_timeout: std::time::Duration::from_secs(60),
         };
         let identity = key_store::ServiceIdentity {
             service_uuid: "uuid-1".into(),
