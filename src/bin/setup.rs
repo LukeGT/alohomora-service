@@ -62,13 +62,14 @@ async fn main() -> ExitCode {
         }
     };
 
-    let (key_dir, local_key, service_identity) = match key_store::prepare_setup_keys(args.name).await {
-        Ok(keys) => keys,
-        Err(e) => {
-            eprintln!("Setup preparation error: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
+    let (key_dir, local_key, service_identity) =
+        match key_store::prepare_setup_keys(args.name).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                eprintln!("Setup preparation error: {}", e);
+                return ExitCode::FAILURE;
+            }
+        };
 
     let has_devices = match key_store::has_registered_devices().await {
         Ok(has) => has,
@@ -137,6 +138,19 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Printed to the terminal only (never logged): the URL embeds the pairing token.
+    let setup_url = key_store::build_setup_url(&pairing_token.value, &config, &service_identity);
+    println!(
+        "To register a local (password) emergency device instead of / in addition to a phone, run:"
+    );
+    println!(
+        "  {}",
+        pass_secret_service::local_device::register_command(&setup_url, config.internal_port)
+    );
+    if config.use_relay {
+        println!("(Relay mode: the alohomora service must not be holding port {}; stop it while registering.)", config.internal_port);
+    }
+
     let (tx, rx) = tokio::sync::oneshot::channel();
     let done_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(tx)));
     let _server_handle = match pass_secret_service::http_server::spawn_setup_server(
@@ -172,10 +186,8 @@ async fn main() -> ExitCode {
                 &session_id,
                 std::time::Duration::from_secs(300),
                 |req: pass_secret_service::http_server::RegisterRequest| async move {
-                    pass_secret_service::http_server::process_register_request(
-                        &local_key, req,
-                    )
-                    .await
+                    pass_secret_service::http_server::process_register_request(&local_key, req)
+                        .await
                 },
             )
             .await;

@@ -527,15 +527,20 @@ pub fn parse_pairing_token(token: &str) -> Result<PairingToken> {
     })
 }
 
-pub fn print_setup_qr_code(token: &str, config: &AppConfig, identity: &ServiceIdentity) -> Result {
-    let setup_url = format!(
+/// The setup URL encoded in the pairing QR code.
+pub fn build_setup_url(token: &str, config: &AppConfig, identity: &ServiceIdentity) -> String {
+    format!(
         "https://alohomora.app/register?d={}&p={}&t={}&su={}&sn={}",
         config.domain,
         config.external_port,
         token,
         identity.service_uuid,
         url_encode(&identity.service_name)
-    );
+    )
+}
+
+pub fn print_setup_qr_code(token: &str, config: &AppConfig, identity: &ServiceIdentity) -> Result {
+    let setup_url = build_setup_url(token, config, identity);
     let qr_code =
         QrCode::new(setup_url.as_bytes()).map_err(|_| Error::EncryptionError("invalid QR data"))?;
     let qr = qr_code

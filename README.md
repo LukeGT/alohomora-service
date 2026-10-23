@@ -111,11 +111,11 @@ If your phone is unavailable you can register a password-protected *local device
 
 Registration reuses Safe Pairing, so it needs approval from an existing device first (or is the very first device):
 
-1. Run `alohomora-setup`; once any existing device approved, it prints a setup URL / pairing token and waits for a registration.
-2. In another terminal on the same host (with access to the key directory), run:
+1. Run `alohomora-setup`; once any existing device approved, it prints the QR code and a ready-to-paste `alohomora-local-device register ...` command (terminal only, never logged; it contains the short-lived pairing token) and waits for a registration.
+2. In another terminal on the same host (with access to the key directory), paste that command, i.e.:
 
    ```sh
-   alohomora-local-device register --setup '<setup URL or token>'   # or paste it on stdin
+   alohomora-local-device register --setup '<setup URL or token>' --server http://127.0.0.1:19969   # --setup can also be piped on stdin
    ```
 
    You are prompted twice for an unlock password (min. 12 characters). A key pair is generated, the public key is registered with the name "Local Terminal Unlock" via the normal `POST /alohomora/register` route on the internal port (`ALOHOMORA_INTERNAL_PORT`, default 19969), and the encrypted private key is stored.

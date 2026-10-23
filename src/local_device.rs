@@ -298,6 +298,14 @@ pub fn parse_setup_input(input: &str) -> Result<SetupInfo> {
     Ok(info)
 }
 
+/// Ready-to-paste command registering a local device from the setup URL.
+/// The URL only contains URL-safe characters, so single quotes are sufficient.
+pub fn register_command(setup_url: &str, internal_port: u16) -> String {
+    format!(
+        "alohomora-local-device register --setup '{setup_url}' --server http://127.0.0.1:{internal_port}"
+    )
+}
+
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -419,6 +427,31 @@ mod tests {
         tampered.m_cost_kib = u32::MAX;
         assert!(decrypt_private_key(&tampered, b"correct horse").is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn register_command_round_trips_through_parser() {
+        let token = "alohomora-abcdefghij-".to_string() + &bs58::encode([7u8; 32]).into_string();
+        let config = crate::config::AppConfig {
+            domain: "example.com".into(),
+            external_port: 443,
+            internal_port: 19969,
+            web_service_url: "https://alohomora.app".into(),
+            use_relay: false,
+        };
+        let identity = key_store::ServiceIdentity {
+            service_uuid: "uuid-1".into(),
+            service_name: "My Host's PC".into(),
+        };
+        let url = key_store::build_setup_url(&token, &config, &identity);
+        let cmd = register_command(&url, config.internal_port);
+        assert!(cmd.starts_with("alohomora-local-device register --setup '"));
+        assert!(cmd.ends_with("--server http://127.0.0.1:19969"));
+        assert!(!url.contains('\''));
+        let quoted = cmd.split('\'').nth(1).unwrap();
+        let info = parse_setup_input(quoted).unwrap();
+        assert_eq!(info.token, token);
+        assert_eq!(info.service_name.as_deref(), Some("My Host's PC"));
     }
 
     #[test]
