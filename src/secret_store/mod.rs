@@ -110,7 +110,13 @@ pub trait SecretStore<'a>: Debug + DynClone {
         attributes: Arc<HashMap<String, String>>,
         key: &SecureKey,
     ) -> Result<String>;
-    async fn set_secret(&self, collection_id: &str, secret_id: &str, value: Vec<u8>, key: &SecureKey) -> Result;
+    async fn set_secret(
+        &self,
+        collection_id: &str,
+        secret_id: &str,
+        value: Vec<u8>,
+        key: &SecureKey,
+    ) -> Result;
     async fn set_secret_label(
         &self,
         collection: Arc<String>,

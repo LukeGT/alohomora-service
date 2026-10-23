@@ -52,6 +52,10 @@ Commands:
 
 The subcommand is optional; ommitting it defaults to `run-service`.
 
+### Authorization timeout
+
+Set `ALOHOMORA_AUTH_TIMEOUT_SECS` (integer seconds, 1-3600, default 60) to control how long the service waits for a mobile approval before failing the request. Invalid values abort startup with a configuration error.
+
 ### Access notifications (`--notify-on-access`)
 
 Pass `-n` / `--notify-on-access` to send a desktop notification via `org.freedesktop.Notifications` every time a secret value is read. Each notification includes the secret label, the accessing application name, its PID, and UID.

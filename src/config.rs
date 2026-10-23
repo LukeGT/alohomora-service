@@ -1,9 +1,11 @@
-use std::env;
+use std::{env, time::Duration};
 
 use crate::error::{Error, Result};
 
 const DEFAULT_DOMAIN: &str = "alohomora.app";
 const DEFAULT_PORT: u16 = 19969;
+const DEFAULT_AUTH_TIMEOUT_SECS: u64 = 60;
+const MAX_AUTH_TIMEOUT_SECS: u64 = 3600;
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -12,6 +14,8 @@ pub struct AppConfig {
     pub internal_port: u16,
     pub web_service_url: String,
     pub use_relay: bool,
+    /// How long to wait for the mobile device to approve an authorization request.
+    pub authorization_timeout: Duration,
 }
 
 impl AppConfig {
@@ -31,12 +35,19 @@ impl AppConfig {
             Err(_) => domain == "alohomora.app",
         };
 
+        let authorization_timeout = read_timeout_secs_env(
+            "ALOHOMORA_AUTH_TIMEOUT_SECS",
+            DEFAULT_AUTH_TIMEOUT_SECS,
+            MAX_AUTH_TIMEOUT_SECS,
+        )?;
+
         Ok(Self {
             domain,
             external_port,
             internal_port,
             web_service_url,
             use_relay,
+            authorization_timeout,
         })
     }
 
@@ -56,6 +67,18 @@ fn read_port_env(name: &str, default: u16) -> Result<u16> {
             .parse::<u16>()
             .map_err(|_| Error::ConfigError(format!("{name} must be a valid u16, got `{value}`"))),
         Err(_) => Ok(default),
+    }
+}
+
+fn read_timeout_secs_env(name: &str, default: u64, max: u64) -> Result<Duration> {
+    match env::var(name) {
+        Ok(value) => match value.trim().parse::<u64>() {
+            Ok(secs) if (1..=max).contains(&secs) => Ok(Duration::from_secs(secs)),
+            _ => Err(Error::ConfigError(format!(
+                "{name} must be an integer between 1 and {max}, got `{value}`"
+            ))),
+        },
+        Err(_) => Ok(Duration::from_secs(default)),
     }
 }
 
@@ -105,9 +128,11 @@ mod tests {
             "ALOHOMORA_WEB_SERVICE_URL",
             "ALOHOMORA_NOTIFICATION_URL",
             "ALOHOMORA_RELAY",
+            "ALOHOMORA_AUTH_TIMEOUT_SECS",
         ]);
 
         let config = AppConfig::from_env().unwrap();
+        assert_eq!(config.authorization_timeout, Duration::from_secs(60));
         assert_eq!(config.domain, "alohomora.app");
         assert_eq!(config.external_port, 443);
         assert_eq!(config.internal_port, 19969);
@@ -184,5 +209,27 @@ mod tests {
             config.notification_url(),
             "https://relay.custom.org/send-notification"
         );
+    }
+
+    #[test]
+    fn test_app_config_authorization_timeout() {
+        let _lock = CONFIG_ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new(&["ALOHOMORA_AUTH_TIMEOUT_SECS"]);
+
+        env::set_var("ALOHOMORA_AUTH_TIMEOUT_SECS", "3600");
+        let config = AppConfig::from_env().unwrap();
+        assert_eq!(config.authorization_timeout, Duration::from_secs(3600));
+
+        env::set_var("ALOHOMORA_AUTH_TIMEOUT_SECS", "1");
+        let config = AppConfig::from_env().unwrap();
+        assert_eq!(config.authorization_timeout, Duration::from_secs(1));
+
+        for bad in ["0", "3601", "-5", "abc", ""] {
+            env::set_var("ALOHOMORA_AUTH_TIMEOUT_SECS", bad);
+            assert!(
+                matches!(AppConfig::from_env(), Err(Error::ConfigError(_))),
+                "expected ConfigError for `{bad}`"
+            );
+        }
     }
 }

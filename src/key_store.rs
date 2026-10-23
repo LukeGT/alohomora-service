@@ -124,8 +124,9 @@ pub async fn read_service_identity(key_dir: &Path) -> Result<Option<ServiceIdent
     let path = key_dir.join(SERVICE_IDENTITY_FILE);
     match read(&path).await {
         Ok(bytes) => {
-            let identity: ServiceIdentity = serde_json::from_slice(&bytes)
-                .map_err(|e| Error::InvalidRequest(format!("failed to parse service identity: {e}")))?;
+            let identity: ServiceIdentity = serde_json::from_slice(&bytes).map_err(|e| {
+                Error::InvalidRequest(format!("failed to parse service identity: {e}"))
+            })?;
             Ok(Some(identity))
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -494,11 +495,7 @@ pub fn parse_pairing_token(token: &str) -> Result<PairingToken> {
     })
 }
 
-pub fn print_setup_qr_code(
-    token: &str,
-    config: &AppConfig,
-    identity: &ServiceIdentity,
-) -> Result {
+pub fn print_setup_qr_code(token: &str, config: &AppConfig, identity: &ServiceIdentity) -> Result {
     let setup_url = format!(
         "https://alohomora.app/register?d={}&p={}&t={}&su={}&sn={}",
         config.domain,
@@ -808,6 +805,7 @@ mod tests {
             internal_port: 12345,
             web_service_url: "https://alohomora.app".to_string(),
             use_relay: false,
+            authorization_timeout: std::time::Duration::from_secs(60),
         };
 
         let result = super::initialize(&config).await;
@@ -843,6 +841,7 @@ mod tests {
             internal_port: 12345,
             web_service_url: "https://alohomora.app".to_string(),
             use_relay: false,
+            authorization_timeout: std::time::Duration::from_secs(60),
         };
 
         // 1. Initially, initialize should fail because pairing keys don't exist yet
@@ -931,35 +930,51 @@ mod tests {
 
     #[tokio::test]
     async fn test_service_identity_lifecycle_and_url_encoding() {
-        let temp_dir = std::env::temp_dir().join(format!("test_identity_dir_{}", nanoid::nanoid!()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("test_identity_dir_{}", nanoid::nanoid!()));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         // 1. Initially no identity exists
-        assert!(super::read_service_identity(&temp_dir).await.unwrap().is_none());
+        assert!(super::read_service_identity(&temp_dir)
+            .await
+            .unwrap()
+            .is_none());
 
         // 2. Create service identity with provided name
-        let identity = super::get_or_create_service_identity(&temp_dir, Some("Alice's Laptop & Co.".to_string()))
-            .await
-            .unwrap();
+        let identity = super::get_or_create_service_identity(
+            &temp_dir,
+            Some("Alice's Laptop & Co.".to_string()),
+        )
+        .await
+        .unwrap();
         assert_eq!(identity.service_name, "Alice's Laptop & Co.");
         assert!(!identity.service_uuid.is_empty());
 
         // 3. Read it back
-        let read_back = super::read_service_identity(&temp_dir).await.unwrap().unwrap();
+        let read_back = super::read_service_identity(&temp_dir)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(read_back, identity);
 
         // 4. Calling get_or_create without name returns existing without changing uuid
-        let same = super::get_or_create_service_identity(&temp_dir, None).await.unwrap();
+        let same = super::get_or_create_service_identity(&temp_dir, None)
+            .await
+            .unwrap();
         assert_eq!(same, identity);
 
         // 5. Calling with a new name updates the name while preserving service_uuid
-        let updated = super::get_or_create_service_identity(&temp_dir, Some("Alice Workstation".to_string()))
-            .await
-            .unwrap();
+        let updated =
+            super::get_or_create_service_identity(&temp_dir, Some("Alice Workstation".to_string()))
+                .await
+                .unwrap();
         assert_eq!(updated.service_uuid, identity.service_uuid);
         assert_eq!(updated.service_name, "Alice Workstation");
 
-        let read_updated = super::read_service_identity(&temp_dir).await.unwrap().unwrap();
+        let read_updated = super::read_service_identity(&temp_dir)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(read_updated.service_name, "Alice Workstation");
 
         // 6. Test url_encode helper
@@ -973,6 +988,7 @@ mod tests {
             internal_port: 19969,
             web_service_url: "https://alohomora.app".to_string(),
             use_relay: true,
+            authorization_timeout: std::time::Duration::from_secs(60),
         };
         let token = "alohomora-testtoken1-1234567890";
         let expected_url = format!(
@@ -1005,6 +1021,7 @@ mod tests {
             internal_port: 12345,
             web_service_url: "https://alohomora.app".to_string(),
             use_relay: false,
+            authorization_timeout: std::time::Duration::from_secs(60),
         };
 
         let raw_local = [55u8; 32];

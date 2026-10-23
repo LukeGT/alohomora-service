@@ -62,13 +62,14 @@ async fn main() -> ExitCode {
         }
     };
 
-    let (key_dir, local_key, service_identity) = match key_store::prepare_setup_keys(args.name).await {
-        Ok(keys) => keys,
-        Err(e) => {
-            eprintln!("Setup preparation error: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
+    let (key_dir, local_key, service_identity) =
+        match key_store::prepare_setup_keys(args.name).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                eprintln!("Setup preparation error: {}", e);
+                return ExitCode::FAILURE;
+            }
+        };
 
     let has_devices = match key_store::has_registered_devices().await {
         Ok(has) => has,
@@ -172,10 +173,8 @@ async fn main() -> ExitCode {
                 &session_id,
                 std::time::Duration::from_secs(300),
                 |req: pass_secret_service::http_server::RegisterRequest| async move {
-                    pass_secret_service::http_server::process_register_request(
-                        &local_key, req,
-                    )
-                    .await
+                    pass_secret_service::http_server::process_register_request(&local_key, req)
+                        .await
                 },
             )
             .await;

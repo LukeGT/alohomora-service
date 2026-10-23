@@ -9,7 +9,7 @@ Alohomora requires root privileges to access `/var/lib/alohomora-service` and de
    - Runs as `User=root`.
    - Points `DBUS_SESSION_BUS_ADDRESS` to the user session bus socket (`unix:path=/run/user/1000/bus`).
    - Points `PASSWORD_STORE_DIR`, `GNUPGHOME`, and `HOME` to the target user's directories (`/home/ubuntu/.password-store`, `/home/ubuntu/.gnupg`).
-   - Configures `ALOHOMORA_DOMAIN`, ports, and `ALOHOMORA_NOTIFICATION_URL`.
+   - Configures `ALOHOMORA_DOMAIN`, ports, `ALOHOMORA_NOTIFICATION_URL`, and `ALOHOMORA_AUTH_TIMEOUT_SECS` (how long to wait for a phone approval, in seconds; default 60, valid 1-3600; the unit sets 3600).
 
 2. **`dbus-session-local.conf`**:
    - D-Bus session configuration drop-in (`/etc/dbus-1/session-local.conf`).

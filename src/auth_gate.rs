@@ -21,8 +21,6 @@ use crate::{
     key_store::{self, SecureKey},
 };
 
-const AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(60);
-
 pub const CHALLENGE_MAGIC: &[u8; 5] = b"ALHM1";
 pub const RESPONSE_MAGIC: &[u8; 5] = b"ALHR1";
 pub const CHALLENGE_PLAINTEXT_LEN: usize = 137;
@@ -113,6 +111,7 @@ struct AuthGateInner {
     web_service_url: String,
     notification_url: String,
     use_relay: bool,
+    authorization_timeout: Duration,
     pending: Mutex<HashMap<String, PendingAuth>>,
 }
 
@@ -142,6 +141,7 @@ impl AuthGate {
                 web_service_url: config.web_service_url.clone(),
                 notification_url: config.notification_url(),
                 use_relay: config.use_relay,
+                authorization_timeout: config.authorization_timeout,
                 pending: Mutex::new(HashMap::new()),
             }),
         }
@@ -207,6 +207,7 @@ impl AuthGate {
             let auth_gate = self.clone();
             let web_service_url = self.inner.web_service_url.clone();
             let session_id = request_uuid_str.clone();
+            let authorization_timeout = self.inner.authorization_timeout;
             tokio::spawn(async move {
                 let client = reqwest::Client::new();
                 let res = crate::http_server::poll_relay_once(
@@ -214,7 +215,7 @@ impl AuthGate {
                     &web_service_url,
                     "authenticate",
                     &session_id,
-                    AUTHORIZATION_TIMEOUT,
+                    authorization_timeout,
                     |req: crate::http_server::AuthenticateRequest| async move {
                         crate::http_server::process_authenticate_request(&auth_gate, req).await
                     },
@@ -310,7 +311,10 @@ impl AuthGate {
 
             let port = if let Some(p) = registration["keychain"]["port"].as_u64() {
                 p.to_string()
-            } else if let Some(p) = registration["keychain"]["port"].as_str().filter(|s| !s.is_empty()) {
+            } else if let Some(p) = registration["keychain"]["port"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+            {
                 p.to_string()
             } else {
                 self.inner.external_port.to_string()
@@ -376,7 +380,7 @@ impl AuthGate {
             }
         }
 
-        match time::timeout(AUTHORIZATION_TIMEOUT, receiver).await {
+        match time::timeout(self.inner.authorization_timeout, receiver).await {
             Ok(Ok(secret_key)) => {
                 debug!("Authentication gate opened for request {request_uuid_str}");
                 Ok(secret_key)
@@ -637,6 +641,7 @@ mod tests {
             internal_port: 19969,
             web_service_url: "https://alohomora.app".to_string(),
             use_relay: false,
+            authorization_timeout: std::time::Duration::from_secs(60),
         };
 
         let auth_gate = AuthGate::new(&config, local_key.clone());
@@ -700,7 +705,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_secret_key_fails_when_service_identity_missing() {
-        let temp_dir = std::env::temp_dir().join(format!("test_auth_gate_no_id_{}", nanoid::nanoid!()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("test_auth_gate_no_id_{}", nanoid::nanoid!()));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let original_key_dir = std::env::var("ALOHOMORA_KEY_DIR").ok();
@@ -714,6 +720,7 @@ mod tests {
             internal_port: 19969,
             web_service_url: "https://alohomora.app".to_string(),
             use_relay: false,
+            authorization_timeout: std::time::Duration::from_secs(60),
         };
         let auth_gate = AuthGate::new(&config, local_key.clone());
 
@@ -740,6 +747,25 @@ mod tests {
             std::env::remove_var("ALOHOMORA_KEY_DIR");
         }
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_new_uses_configured_authorization_timeout() {
+        let mut raw_local_key = [3u8; 32];
+        let local_key = SecureKey::from_slice_mut(&mut raw_local_key).unwrap();
+        let config = AppConfig {
+            domain: "test.example.com".to_string(),
+            external_port: 443,
+            internal_port: 19969,
+            web_service_url: "https://alohomora.app".to_string(),
+            use_relay: false,
+            authorization_timeout: Duration::from_secs(3600),
+        };
+        let auth_gate = AuthGate::new(&config, local_key);
+        assert_eq!(
+            auth_gate.inner.authorization_timeout,
+            Duration::from_secs(3600)
+        );
     }
 
     #[test]

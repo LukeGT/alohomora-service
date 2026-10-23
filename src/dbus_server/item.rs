@@ -115,9 +115,11 @@ impl SecretAccessor<'static> {
             .ok()
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             .or_else(|| {
-                std::env::args()
-                    .next()
-                    .and_then(|a| std::path::Path::new(&a).file_name().map(|n| n.to_string_lossy().into_owned()))
+                std::env::args().next().and_then(|a| {
+                    std::path::Path::new(&a)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                })
             });
 
         Self {

@@ -596,7 +596,9 @@ impl<'a> SecretStore<'a> for RedbSecretStore<'a> {
         let secret_path = collection_dir.join(&*secret_id);
 
         // write the password
-        self.pass.write_password_with_key(secret_path, secret, key).await?;
+        self.pass
+            .write_password_with_key(secret_path, secret, key)
+            .await?;
 
         // write the attributes
         let collections = self.collection_dbs.clone();
@@ -645,13 +647,21 @@ impl<'a> SecretStore<'a> for RedbSecretStore<'a> {
         .unwrap()
     }
 
-    async fn set_secret(&self, collection_id: &str, secret_id: &str, value: Vec<u8>, key: &SecureKey) -> Result {
+    async fn set_secret(
+        &self,
+        collection_id: &str,
+        secret_id: &str,
+        value: Vec<u8>,
+        key: &SecureKey,
+    ) -> Result {
         let collection_dir = Path::new(PASS_SUBDIR).join(&*collection_id);
 
         let secret_path = collection_dir.join(&*secret_id);
 
         // write the password
-        self.pass.write_password_with_key(secret_path, value, key).await?;
+        self.pass
+            .write_password_with_key(secret_path, value, key)
+            .await?;
 
         Ok(())
     }
