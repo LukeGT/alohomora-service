@@ -102,3 +102,51 @@ Options:
 [INFO  pass_secret_service]   Program: gh (PID 123456)
 [INFO  pass_secret_service]   Timestamp: Sun, 1 Jan 2026 01:23:45
 ```
+
+## Local (virtual) device for emergency unlock
+
+If your phone is unavailable you can register a password-protected *local device*. It uses exactly the same protocol as the Android app (RSA-2048 key, `ALHM1` challenge, `ALHR1` response) but the challenge is delivered over loopback HTTP instead of a push notification.
+
+### Registering
+
+Registration reuses Safe Pairing, so it needs approval from an existing device first (or is the very first device):
+
+1. Run `alohomora-setup`; once any existing device approved, it prints the QR code and a ready-to-paste `alohomora-local-device register ...` command (terminal only, never logged; it contains the short-lived pairing token) and waits for a registration.
+2. In another terminal on the same host (with access to the key directory), paste that command, i.e.:
+
+   ```sh
+   alohomora-local-device register --setup '<setup URL or token>' --server http://127.0.0.1:19969   # --setup can also be piped on stdin
+   ```
+
+   You are prompted twice for an unlock password (min. 12 characters). A key pair is generated, the public key is registered with the name "Local Terminal Unlock" via the normal `POST /alohomora/register` route on the internal port (`ALOHOMORA_INTERNAL_PORT`, default 19969), and the encrypted private key is stored.
+
+   If the running service already holds the internal port (relay mode), the setup server cannot bind it; stop the service for the duration of registration or pass `--server` to a reachable setup server.
+
+### Unlocking
+
+When a secret access is pending (the service waits up to 60 seconds), run:
+
+```sh
+alohomora-unlock
+```
+
+Enter the password; the private key is decrypted in memory only, used to answer the pending challenge, then zeroized. Options: `--device-uuid`, `--server`, `--wait <seconds>` (default 30, how long to wait for a request to appear).
+
+### Storage layout
+
+Under the key directory (`ALOHOMORA_KEY_DIR`, default `/var/lib/alohomora-service`):
+
+```
+device-keys/local/<device uuid>/enc_device_registration.json   # daemon side, like Android devices
+device-keys/local/<device uuid>/enc_secret_key.bin             # daemon side, like Android devices
+device-keys/local/<device uuid>/private_key.enc.json           # CLI side, mode 0600
+```
+
+`private_key.enc.json` is versioned JSON holding the Argon2id parameters (m=64 MiB, t=3, p=1 by default), a random 16-byte salt and the AES-256-GCM encrypted PKCS#8 private key. Parameters read back from the file are bounds-checked.
+
+### Security notes
+
+- Local unlocks are logged at `info` (device uuid/name, request uuid, requesting uid/user/pid/process); no secrets are logged and no notification is sent.
+- Pending local challenges are kept in memory only and removed on completion or timeout. `GET /alohomora/local/challenges` is served only when the TCP peer is loopback **and** no `X-Forwarded-For`, `Forwarded`, `X-Real-IP` or `Via` header is present. Challenges are encrypted to the device key, so reading them without the password is useless.
+- There is no unauthenticated registration route; registration needs the one-time pairing token.
+- Anyone who can read the key directory and knows the password can unlock secrets, so treat the password like a root credential. A weak password makes an offline attack on `private_key.enc.json` feasible (Argon2id only slows it down).

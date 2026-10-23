@@ -37,6 +37,10 @@ pub struct ServiceIdentity {
 }
 const DEVICE_KEYS_DIR: &str = "device-keys";
 const ANDROID_DEVICE_KEYS_DIR: &str = "android";
+const LOCAL_DEVICE_KEYS_DIR: &str = "local";
+/// Password-encrypted private key of a local (virtual) device, stored beside the
+/// daemon-side registration in `device-keys/local/<uuid>/`.
+pub const LOCAL_DEVICE_PRIVATE_KEY_FILE: &str = "private_key.enc.json";
 const TEMP_PAIRING_KEYS_DIR: &str = "temp-pairing-keys";
 const ENC_SECRET_KEY_FILE: &str = "enc_secret_key.bin";
 const ENC_DEVICE_REGISTRATION_FILE: &str = "enc_device_registration.json";
@@ -53,7 +57,33 @@ pub struct StartupKeys {
     pub local_key: SecureKey,
 }
 
+/// Kind of registered device; determines the `device-keys/<kind>/` directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceKind {
+    Android,
+    Local,
+}
+
+impl DeviceKind {
+    pub const ALL: [DeviceKind; 2] = [DeviceKind::Android, DeviceKind::Local];
+
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            DeviceKind::Android => ANDROID_DEVICE_KEYS_DIR,
+            DeviceKind::Local => LOCAL_DEVICE_KEYS_DIR,
+        }
+    }
+}
+
+pub fn device_dir(key_dir: &Path, kind: DeviceKind, device_uuid: &str) -> PathBuf {
+    key_dir
+        .join(DEVICE_KEYS_DIR)
+        .join(kind.dir_name())
+        .join(device_uuid)
+}
+
 pub struct AndroidDeviceAuthBlob {
+    pub kind: DeviceKind,
     pub device_uuid: String,
     pub encrypted_secret_key: SecureBlob,
 }
@@ -124,8 +154,9 @@ pub async fn read_service_identity(key_dir: &Path) -> Result<Option<ServiceIdent
     let path = key_dir.join(SERVICE_IDENTITY_FILE);
     match read(&path).await {
         Ok(bytes) => {
-            let identity: ServiceIdentity = serde_json::from_slice(&bytes)
-                .map_err(|e| Error::InvalidRequest(format!("failed to parse service identity: {e}")))?;
+            let identity: ServiceIdentity = serde_json::from_slice(&bytes).map_err(|e| {
+                Error::InvalidRequest(format!("failed to parse service identity: {e}"))
+            })?;
             Ok(Some(identity))
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -380,19 +411,21 @@ pub async fn has_registered_devices() -> Result<bool> {
 }
 
 pub async fn has_device_keys(key_dir: &Path) -> Result<bool> {
-    let android_dir = key_dir.join(DEVICE_KEYS_DIR).join(ANDROID_DEVICE_KEYS_DIR);
-    let mut entries = match read_dir(android_dir).await {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e.into()),
-    };
+    for kind in DeviceKind::ALL {
+        let kind_dir = key_dir.join(DEVICE_KEYS_DIR).join(kind.dir_name());
+        let mut entries = match read_dir(kind_dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
 
-    while let Some(entry) = entries.next_entry().await? {
-        if entry.file_type().await?.is_dir() {
-            match metadata(entry.path().join(ENC_SECRET_KEY_FILE)).await {
-                Ok(_) => return Ok(true),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_dir() {
+                match metadata(entry.path().join(ENC_SECRET_KEY_FILE)).await {
+                    Ok(_) => return Ok(true),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
     }
@@ -494,19 +527,20 @@ pub fn parse_pairing_token(token: &str) -> Result<PairingToken> {
     })
 }
 
-pub fn print_setup_qr_code(
-    token: &str,
-    config: &AppConfig,
-    identity: &ServiceIdentity,
-) -> Result {
-    let setup_url = format!(
+/// The setup URL encoded in the pairing QR code.
+pub fn build_setup_url(token: &str, config: &AppConfig, identity: &ServiceIdentity) -> String {
+    format!(
         "https://alohomora.app/register?d={}&p={}&t={}&su={}&sn={}",
         config.domain,
         config.external_port,
         token,
         identity.service_uuid,
         url_encode(&identity.service_name)
-    );
+    )
+}
+
+pub fn print_setup_qr_code(token: &str, config: &AppConfig, identity: &ServiceIdentity) -> Result {
+    let setup_url = build_setup_url(token, config, identity);
     let qr_code =
         QrCode::new(setup_url.as_bytes()).map_err(|_| Error::EncryptionError("invalid QR data"))?;
     let qr = qr_code
@@ -610,10 +644,22 @@ pub async fn store_android_device_registration(
     encrypted_registration_json: &SecureBlob,
     encrypted_secret_key: &SecureBlob,
 ) -> Result {
-    let device_dir = get_key_dir()
-        .join(DEVICE_KEYS_DIR)
-        .join(ANDROID_DEVICE_KEYS_DIR)
-        .join(device_uuid);
+    store_device_registration(
+        DeviceKind::Android,
+        device_uuid,
+        encrypted_registration_json,
+        encrypted_secret_key,
+    )
+    .await
+}
+
+pub async fn store_device_registration(
+    kind: DeviceKind,
+    device_uuid: &str,
+    encrypted_registration_json: &SecureBlob,
+    encrypted_secret_key: &SecureBlob,
+) -> Result {
+    let device_dir = device_dir(&get_key_dir(), kind, device_uuid);
     ensure_private_dir(&device_dir).await?;
     write_private_secure_file(
         &device_dir.join(ENC_DEVICE_REGISTRATION_FILE),
@@ -623,34 +669,37 @@ pub async fn store_android_device_registration(
     Ok(())
 }
 
+/// Lists every registered device (all kinds) that has an encrypted secret key.
 pub async fn list_android_device_auth_blobs() -> Result<Vec<AndroidDeviceAuthBlob>> {
-    let android_dir = get_key_dir()
-        .join(DEVICE_KEYS_DIR)
-        .join(ANDROID_DEVICE_KEYS_DIR);
-    let mut entries = match read_dir(android_dir).await {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
     let mut devices = Vec::new();
 
-    while let Some(entry) = entries.next_entry().await? {
-        if !entry.file_type().await?.is_dir() {
-            continue;
-        }
-
-        let device_uuid = entry.file_name().to_string_lossy().into_owned();
-        let encrypted_secret_key_path = entry.path().join(ENC_SECRET_KEY_FILE);
-        let encrypted_secret_key = match read(encrypted_secret_key_path).await {
-            Ok(bytes) => secure_blob_from_vec(bytes)?,
+    for kind in DeviceKind::ALL {
+        let kind_dir = get_key_dir().join(DEVICE_KEYS_DIR).join(kind.dir_name());
+        let mut entries = match read_dir(kind_dir).await {
+            Ok(entries) => entries,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e.into()),
         };
 
-        devices.push(AndroidDeviceAuthBlob {
-            device_uuid,
-            encrypted_secret_key,
-        });
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_dir() {
+                continue;
+            }
+
+            let device_uuid = entry.file_name().to_string_lossy().into_owned();
+            let encrypted_secret_key_path = entry.path().join(ENC_SECRET_KEY_FILE);
+            let encrypted_secret_key = match read(encrypted_secret_key_path).await {
+                Ok(bytes) => secure_blob_from_vec(bytes)?,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+
+            devices.push(AndroidDeviceAuthBlob {
+                kind,
+                device_uuid,
+                encrypted_secret_key,
+            });
+        }
     }
 
     Ok(devices)
@@ -660,11 +709,15 @@ pub async fn read_android_device_registration(
     device_uuid: &str,
     local_key: &SecureKey,
 ) -> Result<serde_json::Value> {
-    let device_dir = get_key_dir()
-        .join(DEVICE_KEYS_DIR)
-        .join(ANDROID_DEVICE_KEYS_DIR)
-        .join(device_uuid);
-    let path = device_dir.join(ENC_DEVICE_REGISTRATION_FILE);
+    read_device_registration(DeviceKind::Android, device_uuid, local_key).await
+}
+
+pub async fn read_device_registration(
+    kind: DeviceKind,
+    device_uuid: &str,
+    local_key: &SecureKey,
+) -> Result<serde_json::Value> {
+    let path = device_dir(&get_key_dir(), kind, device_uuid).join(ENC_DEVICE_REGISTRATION_FILE);
     let encrypted = read(&path).await?;
     let decrypted = decrypt_aes256_gcm(local_key, &encrypted)?;
     let registration: serde_json::Value = decrypted
@@ -931,35 +984,51 @@ mod tests {
 
     #[tokio::test]
     async fn test_service_identity_lifecycle_and_url_encoding() {
-        let temp_dir = std::env::temp_dir().join(format!("test_identity_dir_{}", nanoid::nanoid!()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("test_identity_dir_{}", nanoid::nanoid!()));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         // 1. Initially no identity exists
-        assert!(super::read_service_identity(&temp_dir).await.unwrap().is_none());
+        assert!(super::read_service_identity(&temp_dir)
+            .await
+            .unwrap()
+            .is_none());
 
         // 2. Create service identity with provided name
-        let identity = super::get_or_create_service_identity(&temp_dir, Some("Alice's Laptop & Co.".to_string()))
-            .await
-            .unwrap();
+        let identity = super::get_or_create_service_identity(
+            &temp_dir,
+            Some("Alice's Laptop & Co.".to_string()),
+        )
+        .await
+        .unwrap();
         assert_eq!(identity.service_name, "Alice's Laptop & Co.");
         assert!(!identity.service_uuid.is_empty());
 
         // 3. Read it back
-        let read_back = super::read_service_identity(&temp_dir).await.unwrap().unwrap();
+        let read_back = super::read_service_identity(&temp_dir)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(read_back, identity);
 
         // 4. Calling get_or_create without name returns existing without changing uuid
-        let same = super::get_or_create_service_identity(&temp_dir, None).await.unwrap();
+        let same = super::get_or_create_service_identity(&temp_dir, None)
+            .await
+            .unwrap();
         assert_eq!(same, identity);
 
         // 5. Calling with a new name updates the name while preserving service_uuid
-        let updated = super::get_or_create_service_identity(&temp_dir, Some("Alice Workstation".to_string()))
-            .await
-            .unwrap();
+        let updated =
+            super::get_or_create_service_identity(&temp_dir, Some("Alice Workstation".to_string()))
+                .await
+                .unwrap();
         assert_eq!(updated.service_uuid, identity.service_uuid);
         assert_eq!(updated.service_name, "Alice Workstation");
 
-        let read_updated = super::read_service_identity(&temp_dir).await.unwrap().unwrap();
+        let read_updated = super::read_service_identity(&temp_dir)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(read_updated.service_name, "Alice Workstation");
 
         // 6. Test url_encode helper
