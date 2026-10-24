@@ -17,6 +17,7 @@ use crate::{
 };
 
 pub mod auth_gate;
+pub mod caller_command;
 pub mod cli;
 pub mod config;
 pub mod dbus_server;
@@ -25,7 +26,11 @@ pub mod http_server;
 pub mod key_store;
 pub mod local_device;
 pub mod pass;
+pub mod process_cmdline;
+pub mod process_tree;
 pub mod secret_store;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 // Constants from the spec
 const WELL_KNOWN_NAME: &'static str = "org.freedesktop.secrets";

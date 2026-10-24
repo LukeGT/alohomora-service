@@ -131,6 +131,9 @@ pub struct LocalChallenge {
     pub username: String,
     pub pid: String,
     pub process_name: String,
+    /// Absent when parked by an older daemon.
+    #[serde(default)]
+    pub command_line: String,
     pub access_timestamp_ms: String,
     pub domain: String,
     pub port: String,
@@ -147,6 +150,7 @@ struct AndroidAuthPayload {
     username: String,
     pid: String,
     process_name: String,
+    command_line: String,
     access_timestamp_ms: String,
     domain: String,
     port: String,
@@ -389,6 +393,7 @@ impl AuthGate {
                         username: payload.username,
                         pid: payload.pid,
                         process_name: payload.process_name,
+                        command_line: payload.command_line,
                         access_timestamp_ms: payload.access_timestamp_ms,
                         domain: payload.domain,
                         port: payload.port,
@@ -418,6 +423,7 @@ impl AuthGate {
                 "username": payload.username,
                 "pid": payload.pid,
                 "process_name": payload.process_name,
+                "command_line": payload.command_line,
                 "access_timestamp_ms": payload.access_timestamp_ms,
                 "domain": payload.domain,
                 "port": payload.port,
@@ -554,6 +560,7 @@ impl AuthGate {
             username: optional_string(accessor.username.as_ref()),
             pid: accessor.pid.to_string(),
             process_name: optional_string(accessor.process_name.as_ref()),
+            command_line: optional_string(accessor.cmdline.as_ref()),
             access_timestamp_ms: timestamp_ms.to_string(),
             domain,
             port,
@@ -881,6 +888,7 @@ mod tests {
         assert_eq!(payload.uid, unsafe { libc::getuid() }.to_string());
         assert!(!payload.username.is_empty());
         assert!(!payload.process_name.is_empty());
+        assert!(!payload.command_line.is_empty());
         let ts: i64 = payload.access_timestamp_ms.parse().unwrap();
         assert!(ts > 0);
         assert_eq!(payload.service_uuid, "svc-uuid-123");
@@ -910,8 +918,44 @@ mod tests {
         assert_eq!(payload.uid, "0");
         assert!(payload.username.is_empty());
         assert!(payload.process_name.is_empty());
+        assert!(payload.command_line.is_empty());
         let ts: i64 = payload.access_timestamp_ms.parse().unwrap();
         assert!(ts > 0);
+    }
+
+    #[test]
+    fn test_local_challenge_without_command_line_still_parses() {
+        let old = serde_json::json!({
+            "request_uuid": "r", "device_uuid": "d", "device_name": "n",
+            "encrypted_blob": "b", "ephemeral_public_key": "e", "uid": "1",
+            "username": "u", "pid": "2", "process_name": "p",
+            "access_timestamp_ms": "3", "domain": "x", "port": "443",
+            "service_uuid": "s", "service_name": "h"
+        });
+        let challenge: LocalChallenge = serde_json::from_value(old).unwrap();
+        assert_eq!(challenge.command_line, "");
+    }
+
+    #[test]
+    fn test_build_auth_payload_includes_synthetic_command_line() {
+        let mut accessor = SecretAccessor::default();
+        accessor.cmdline = Some("tool --flag value".to_string()).into();
+        let identity = key_store::ServiceIdentity {
+            service_uuid: "svc".to_string(),
+            service_name: "Host".to_string(),
+        };
+        let payload = AuthGate::build_auth_payload(
+            "req",
+            "blob".to_string(),
+            "pub".to_string(),
+            &accessor,
+            "example.com".to_string(),
+            "443".to_string(),
+            &identity,
+        );
+        assert_eq!(payload.command_line, "tool --flag value");
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["command_line"], "tool --flag value");
     }
 
     #[test]
