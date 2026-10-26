@@ -13,6 +13,7 @@ When you run `sudo <command>`:
    ```
 4. **Push approval**: Tap **Approve** on your phone (using fingerprint/face biometric). Alohomora releases the token, and `sudo` executes immediately without asking for a password.
 5. **Password fallback**: Hit **Enter** at the terminal prompt (or if phone/service times out or fails, in which case an explanatory message is printed first), and sudo falls back to standard Linux password prompt:
+   Without a tty there is no password fallback: sudo prints the explanation (to the stderr of the process that ran it) followed by `sudo: PAM error: System error`, and does not retry. The script avoids `pam_exec`'s `stdout` option because sudo-rs aborts with a misleading "A terminal is required" if any PAM message arrives without a tty.
    ```text
    [sudo] password for ubuntu: 
    ```

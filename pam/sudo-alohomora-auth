@@ -57,10 +57,13 @@ if [ $STATUS -eq 0 ]; then
     fi
     exit 0
 else
-    # Explain the failure; pam_exec's "stdout" option relays this to sudo, with or without a tty
+    # Explain the failure. pam_exec output (the "stdout" option) makes sudo-rs abort when there is no tty,
+    # so write to the terminal, or else to the stderr of sudo's parent (sudo itself is root-owned).
     if [ -n "$TTY_DEV" ] && [ -w "$TTY_DEV" ]; then
-        printf "\n" > "$TTY_DEV"
+        printf "\nAlohomora: phone approval was not received (denied, timed out, or the relay was unreachable); falling back to password authentication.\n" > "$TTY_DEV"
+    else
+        echo "Alohomora: phone approval was not received (denied, timed out, or the relay was unreachable), and there is no terminal for password authentication." \
+            >> "/proc/$(awk '{print $4}' /proc/$PPID/stat)/fd/2" 2>/dev/null
     fi
-    echo "Alohomora: phone approval was not received (denied, timed out, or the relay was unreachable); falling back to password authentication."
     exit 1
 fi
