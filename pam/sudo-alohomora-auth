@@ -5,8 +5,28 @@ TARGET_USER="${PAM_USER:-ubuntu}"
 TARGET_UID="$(id -u "$TARGET_USER" 2>/dev/null || echo 1000)"
 export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${TARGET_UID}/bus"
 
+# Identify the user's terminal. This must match the guard in pam-sudo (PAM_TTY is a /dev path);
+# sudo-rs sets PAM_TTY only when it has a tty, and aborts if a PAM message arrives without one.
+TTY_DEV=""
+if [[ "${PAM_TTY:-}" == /dev/* ]]; then
+    TTY_DEV="$PAM_TTY"
+fi
+
+# Explain a failed approval: to the terminal, else (pam_exec output would make sudo-rs abort) to
+# the stderr of sudo's parent, since sudo itself is root-owned. Always log to the journal too.
+explain() {
+    logger -t alohomora-sudo "$1"
+    if [ -n "$TTY_DEV" ] && [ -w "$TTY_DEV" ]; then
+        printf "\nAlohomora: %s; falling back to password authentication.\n" "$1" > "$TTY_DEV"
+    else
+        echo "Alohomora: $1, and there is no terminal for password authentication." \
+            >> "/proc/$(ps -o ppid= -p "$PPID" | tr -d ' ')/fd/2" 2>/dev/null
+    fi
+}
+
 # Fall back immediately to password if Alohomora service is inactive
 if ! systemctl is-active --quiet alohomora-service; then
+    explain "the alohomora-service is not running"
     exit 1
 fi
 
@@ -16,23 +36,6 @@ SECRET_PID=$!
 
 # Ensure background lookup is cleaned up on script exit
 trap 'kill "$SECRET_PID" 2>/dev/null; wait "$SECRET_PID" 2>/dev/null' EXIT INT TERM
-
-# Identify the user's terminal (PAM passes PAM_TTY to pam_exec)
-TTY_DEV=""
-if [ -n "${PAM_TTY:-}" ]; then
-    if [[ "$PAM_TTY" == /* ]]; then
-        TTY_DEV="$PAM_TTY"
-    else
-        TTY_DEV="/dev/$PAM_TTY"
-    fi
-fi
-
-if [ -z "$TTY_DEV" ] || [[ ! "$TTY_DEV" =~ ^/dev/(pts/[0-9]+|tty[0-9a-zA-Z]*)$ ]]; then
-    PPID_FD0=$(readlink -f "/proc/$PPID/fd/0" 2>/dev/null || true)
-    if [[ "$PPID_FD0" =~ ^/dev/(pts/[0-9]+|tty[0-9a-zA-Z]*)$ ]]; then
-        TTY_DEV="$PPID_FD0"
-    fi
-fi
 
 # If a valid terminal is available and accessible, prompt and monitor Enter key
 if [ -n "$TTY_DEV" ] && [ -r "$TTY_DEV" ] && [ -w "$TTY_DEV" ]; then
@@ -57,10 +60,6 @@ if [ $STATUS -eq 0 ]; then
     fi
     exit 0
 else
-    # Explain the failure; pam_exec's "stdout" option relays this to sudo, with or without a tty
-    if [ -n "$TTY_DEV" ] && [ -w "$TTY_DEV" ]; then
-        printf "\n" > "$TTY_DEV"
-    fi
-    echo "Alohomora: phone approval was not received (denied, timed out, or the relay was unreachable); falling back to password authentication."
+    explain "phone approval was not received (denied, timed out, or the relay was unreachable)"
     exit 1
 fi

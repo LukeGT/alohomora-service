@@ -16,6 +16,7 @@ When you run `sudo <command>`:
    ```text
    [sudo] password for ubuntu: 
    ```
+   Without a tty there is no password fallback: sudo prints the explanation (to the stderr of the process that ran it) followed by `sudo: PAM error: System error`, and does not retry. The script avoids `pam_exec`'s `stdout` option because sudo-rs aborts with a misleading "A terminal is required" if any PAM message arrives without a tty.
 
 ## Prerequisites
 

@@ -6,7 +6,13 @@ session    required   pam_limits.so
 session    required   pam_env.so readenv=1 user_readenv=0
 session    required   pam_env.so readenv=1 envfile=/etc/default/locale user_readenv=0
 
-auth       [success=done default=ignore] pam_exec.so quiet stdout /usr/local/bin/sudo-alohomora-auth
+auth       [success=done default=ignore] pam_exec.so quiet /usr/local/bin/sudo-alohomora-auth
+# Without a tty a password prompt cannot work, and sudo-rs would only say "A terminal is required".
+# Skip the deny below when PAM_TTY is a device (password fallback is possible); otherwise fail
+# fast. pam_exec always returns PAM_SYSTEM_ERR, which sudo-rs reports once without retrying
+# (pam_deny would be retried 3 times, re-sending the push each time).
+auth       [success=1 default=ignore] pam_succeed_if.so quiet tty =~ /dev/*
+auth       requisite  pam_exec.so quiet /bin/false
 @include common-auth
 @include common-account
 @include common-session-noninteractive
