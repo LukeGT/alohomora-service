@@ -57,5 +57,10 @@ if [ $STATUS -eq 0 ]; then
     fi
     exit 0
 else
+    # Explain the failure; pam_exec's "stdout" option relays this to sudo, with or without a tty
+    if [ -n "$TTY_DEV" ] && [ -w "$TTY_DEV" ]; then
+        printf "\n" > "$TTY_DEV"
+    fi
+    echo "Alohomora: phone approval was not received (denied, timed out, or the relay was unreachable); falling back to password authentication."
     exit 1
 fi

@@ -12,7 +12,7 @@ When you run `sudo <command>`:
    Alohomora push sent. Press Enter for password: 
    ```
 4. **Push approval**: Tap **Approve** on your phone (using fingerprint/face biometric). Alohomora releases the token, and `sudo` executes immediately without asking for a password.
-5. **Password fallback**: Hit **Enter** at the terminal prompt (or if phone/service times out or fails), and sudo immediately falls back to standard Linux password prompt:
+5. **Password fallback**: Hit **Enter** at the terminal prompt (or if phone/service times out or fails, in which case an explanatory message is printed first), and sudo falls back to standard Linux password prompt:
    ```text
    [sudo] password for ubuntu: 
    ```
