@@ -61,6 +61,19 @@ else
     if [ -n "$TTY_DEV" ] && [ -w "$TTY_DEV" ]; then
         printf "\n" > "$TTY_DEV"
     fi
-    echo "Alohomora: phone approval was not received (denied, timed out, or the relay was unreachable); falling back to password authentication."
+    MSG="Alohomora: phone approval was not received (denied, timed out, or the relay was unreachable); falling back to password authentication."
+    echo "$MSG"
+    # sudo drops pam_exec output when it has no tty. This script runs as the invoking user, so
+    # write to the stderr of the first ancestor it may open (the process that ran sudo).
+    if [ -z "$TTY_DEV" ] || [ ! -w "$TTY_DEV" ]; then
+        ANCESTOR=$PPID
+        for _ in 1 2 3 4; do
+            if echo "$MSG" >> "/proc/$ANCESTOR/fd/2" 2>/dev/null; then
+                break
+            fi
+            ANCESTOR=$(awk '{print $4}' "/proc/$ANCESTOR/stat" 2>/dev/null) || break
+            [ "${ANCESTOR:-0}" -gt 1 ] || break
+        done
+    fi
     exit 1
 fi
