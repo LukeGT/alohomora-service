@@ -106,6 +106,9 @@ async fn run(args: Args) -> Result<(), String> {
             challenge.pid,
             challenge.process_name
         );
+        if !challenge.command_line.is_empty() {
+            println!("  command: {}", challenge.command_line);
+        }
         let response: AuthenticateRequest =
             match local_device::answer_challenge(&device_key, &challenge) {
                 Ok(r) => r,
