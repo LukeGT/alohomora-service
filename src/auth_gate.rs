@@ -104,6 +104,40 @@ struct PendingAuth {
     ephemeral_private_key: RsaPrivateKey,
 }
 
+/// Removes a request's `pending` and `local_challenges` entries (and stops
+/// its relay poll) when `request_secret_key` is cancelled mid-wait.
+struct PendingGuard {
+    gate: AuthGate,
+    request_uuid: String,
+    relay_task: Option<tokio::task::AbortHandle>,
+}
+
+impl PendingGuard {
+    fn disarm(mut self) {
+        self.request_uuid.clear();
+    }
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if self.request_uuid.is_empty() {
+            return;
+        }
+        if let Some(task) = self.relay_task.take() {
+            task.abort();
+        }
+        debug!("Authentication request {} cancelled", self.request_uuid);
+        let inner = self.gate.inner.clone();
+        let request_uuid = std::mem::take(&mut self.request_uuid);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                inner.pending.lock().await.remove(&request_uuid);
+                inner.local_challenges.lock().await.remove(&request_uuid);
+            });
+        }
+    }
+}
+
 struct AuthGateInner {
     local_key: SecureKey,
     domain: String,
@@ -179,6 +213,15 @@ impl AuthGate {
         &self.inner.local_key
     }
 
+    pub fn authorization_timeout(&self) -> Duration {
+        self.inner.authorization_timeout
+    }
+
+    /// Number of requests currently waiting for a device response.
+    pub async fn pending_request_count(&self) -> usize {
+        self.inner.pending.lock().await.len()
+    }
+
     pub async fn pending_local_challenges(&self) -> Vec<LocalChallenge> {
         let challenges = self.inner.local_challenges.lock().await;
         challenges.values().flatten().cloned().collect()
@@ -226,9 +269,12 @@ impl AuthGate {
         let request_uuid = Uuid::new_v4();
         let request_uuid_str = request_uuid.to_string();
 
-        let mut rng = OsRng;
-        let ephemeral_private_key = RsaPrivateKey::new(&mut rng, 2048)
-            .map_err(|_| Error::EncryptionError("failed to generate ephemeral RSA key"))?;
+        // CPU-heavy: keep it off the async workers so D-Bus replies are not delayed
+        let ephemeral_private_key =
+            tokio::task::spawn_blocking(|| RsaPrivateKey::new(&mut OsRng, 2048))
+                .await
+                .map_err(|_| Error::EncryptionError("ephemeral RSA key generation failed"))?
+                .map_err(|_| Error::EncryptionError("failed to generate ephemeral RSA key"))?;
         let ephemeral_public_key_spki =
             ephemeral_private_key
                 .to_public_key()
@@ -248,13 +294,19 @@ impl AuthGate {
                 },
             );
         }
+        // Cleans up if this future is dropped (e.g. a dismissed D-Bus prompt).
+        let mut guard = PendingGuard {
+            gate: self.clone(),
+            request_uuid: request_uuid_str.clone(),
+            relay_task: None,
+        };
 
         if self.inner.use_relay {
             let auth_gate = self.clone();
             let web_service_url = self.inner.web_service_url.clone();
             let session_id = request_uuid_str.clone();
             let authorization_timeout = self.inner.authorization_timeout;
-            tokio::spawn(async move {
+            let relay_task = tokio::spawn(async move {
                 let client = reqwest::Client::new();
                 let res = crate::http_server::poll_relay_once(
                     &client,
@@ -271,8 +323,11 @@ impl AuthGate {
                     debug!("Relay authenticate poll ended: {err}");
                 }
             });
+            guard.relay_task = Some(relay_task.abort_handle());
         }
 
+        // devices that received a push or a parked local challenge
+        let mut delivered = 0usize;
         for device in devices {
             // Decrypt the device registration to retrieve the FCM token and public key
             let registration = match key_store::read_device_registration(
@@ -400,6 +455,7 @@ impl AuthGate {
                         service_uuid: payload.service_uuid,
                         service_name: payload.service_name,
                     });
+                delivered += 1;
                 continue;
             }
 
@@ -441,6 +497,7 @@ impl AuthGate {
             match client.post(url).json(&request_body).send().await {
                 Ok(resp) => {
                     if resp.status().is_success() {
+                        delivered += 1;
                         info!(
                             "Successfully sent notification request to web service for device {}",
                             device.device_uuid
@@ -465,23 +522,32 @@ impl AuthGate {
             }
         }
 
+        if delivered == 0 {
+            // Nobody can answer: fail now instead of waiting out the timeout.
+            // Dropping the armed guard removes the entries and stops the relay.
+            warn!("Authentication request {request_uuid_str}: no device could be notified");
+            drop(guard);
+            return Err(Error::PermissionDenied);
+        }
+
         let outcome = time::timeout(self.inner.authorization_timeout, receiver).await;
         self.inner
             .local_challenges
             .lock()
             .await
             .remove(&request_uuid_str);
+        // already gone after a successful completion
+        self.inner.pending.lock().await.remove(&request_uuid_str);
+        // Cleaned up; disarm only now so a cancellation during the awaits
+        // above still runs the guard. The relay task finishes on its own.
+        guard.disarm();
         match outcome {
             Ok(Ok(secret_key)) => {
                 debug!("Authentication gate opened for request {request_uuid_str}");
                 Ok(secret_key)
             }
-            Ok(Err(_)) => {
-                self.inner.pending.lock().await.remove(&request_uuid_str);
-                Err(Error::PermissionDenied)
-            }
+            Ok(Err(_)) => Err(Error::PermissionDenied),
             Err(_) => {
-                self.inner.pending.lock().await.remove(&request_uuid_str);
                 warn!("Authentication request {request_uuid_str} timed out");
                 Err(Error::PermissionDenied)
             }
@@ -800,8 +866,144 @@ mod tests {
         assert!(replay_result.is_err());
     }
 
+    fn test_gate() -> AuthGate {
+        let mut raw_local_key = [17u8; 32];
+        let local_key = SecureKey::from_slice_mut(&mut raw_local_key).unwrap();
+        let config = AppConfig {
+            domain: "test.example.com".to_string(),
+            external_port: 443,
+            internal_port: 19969,
+            web_service_url: "https://alohomora.app".to_string(),
+            use_relay: false,
+            authorization_timeout: std::time::Duration::from_secs(60),
+        };
+        AuthGate::new(&config, local_key)
+    }
+
+    async fn park_request(gate: &AuthGate, request_uuid: &str) {
+        let (sender, _receiver) = oneshot::channel();
+        let ephemeral_private_key = RsaPrivateKey::new(&mut OsRng, 1024).unwrap();
+        gate.inner.pending.lock().await.insert(
+            request_uuid.to_string(),
+            PendingAuth {
+                sender,
+                ephemeral_private_key,
+            },
+        );
+        let field = String::new;
+        gate.inner.local_challenges.lock().await.insert(
+            request_uuid.to_string(),
+            vec![LocalChallenge {
+                request_uuid: request_uuid.to_string(),
+                device_uuid: field(),
+                device_name: field(),
+                encrypted_blob: field(),
+                ephemeral_public_key: field(),
+                uid: field(),
+                username: field(),
+                pid: field(),
+                process_name: field(),
+                command_line: field(),
+                access_timestamp_ms: field(),
+                domain: field(),
+                port: field(),
+                service_uuid: field(),
+                service_name: field(),
+            }],
+        );
+    }
+
     #[tokio::test]
+    async fn test_cancelled_request_cleans_up_pending_entries() {
+        let gate = test_gate();
+        park_request(&gate, "cancelled").await;
+        park_request(&gate, "other").await;
+        let relay = tokio::spawn(std::future::pending::<()>());
+
+        drop(PendingGuard {
+            gate: gate.clone(),
+            request_uuid: "cancelled".into(),
+            relay_task: Some(relay.abort_handle()),
+        });
+
+        assert!(relay.await.unwrap_err().is_cancelled());
+        for _ in 0..100 {
+            if gate.pending_request_count().await == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(gate.pending_request_count().await, 1);
+        let challenges = gate.pending_local_challenges().await;
+        assert_eq!(challenges.len(), 1);
+        assert_eq!(challenges[0].request_uuid, "other");
+    }
+
+    #[tokio::test]
+    async fn test_disarmed_guard_leaves_entries_alone() {
+        let gate = test_gate();
+        park_request(&gate, "done").await;
+        PendingGuard {
+            gate: gate.clone(),
+            request_uuid: "done".into(),
+            relay_task: None,
+        }
+        .disarm();
+        tokio::task::yield_now().await;
+        assert_eq!(gate.pending_request_count().await, 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the env lock must span the whole test
+    async fn test_request_secret_key_fails_fast_when_no_device_can_be_notified() {
+        let _env = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::test_support::TempDir::new();
+        let original_key_dir = std::env::var("ALOHOMORA_KEY_DIR").ok();
+        std::env::set_var("ALOHOMORA_KEY_DIR", dir.path());
+
+        key_store::write_service_identity(
+            dir.path(),
+            &key_store::ServiceIdentity {
+                service_uuid: Uuid::new_v4().to_string(),
+                service_name: "Test Host".into(),
+            },
+        )
+        .await
+        .unwrap();
+        // a registration that cannot be read: no push and no local challenge
+        let dummy_blob = key_store::secure_blob_from_vec(vec![0u8; 84]).unwrap();
+        key_store::store_android_device_registration("dummy-dev-uuid", &dummy_blob, &dummy_blob)
+            .await
+            .unwrap();
+
+        // the gate is configured to wait 60s for an answer
+        let gate = test_gate();
+        let result = time::timeout(Duration::from_secs(20), gate.request_secret_key(None))
+            .await
+            .expect("must not wait for the authorization timeout");
+        assert!(matches!(result, Err(Error::PermissionDenied)));
+        for _ in 0..100 {
+            if gate.pending_request_count().await == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(gate.pending_request_count().await, 0);
+
+        match original_key_dir {
+            Some(val) => std::env::set_var("ALOHOMORA_KEY_DIR", val),
+            None => std::env::remove_var("ALOHOMORA_KEY_DIR"),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the env lock must span the whole test
     async fn test_request_secret_key_fails_when_service_identity_missing() {
+        let _env = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let temp_dir =
             std::env::temp_dir().join(format!("test_auth_gate_no_id_{}", nanoid::nanoid!()));
         std::fs::create_dir_all(&temp_dir).unwrap();

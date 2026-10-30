@@ -65,21 +65,22 @@ impl Session {
         }
     }
 
-    pub fn decrypt(&self, secret: Secret, header: &Header<'_>) -> Result<Vec<u8>> {
-        // make sure they're allowed to do this
-        if !header.sender().is_some_and(|s| self.client_name == *s) {
-            return Err(Error::PermissionDenied);
+    /// Only the client that opened the session may use it.
+    pub fn check_owner(&self, header: &Header<'_>) -> Result {
+        if header.sender().is_some_and(|s| self.client_name == *s) {
+            Ok(())
+        } else {
+            Err(Error::PermissionDenied)
         }
+    }
 
+    pub fn decrypt(&self, secret: Secret, header: &Header<'_>) -> Result<Vec<u8>> {
+        self.check_owner(header)?;
         self.transfer.decrypt(secret)
     }
 
     pub fn encrypt(&self, secret: Vec<u8>, header: &Header<'_>) -> Result<Secret> {
-        // make sure they're allowed to do this
-        if !header.sender().is_some_and(|s| self.client_name == *s) {
-            return Err(Error::PermissionDenied);
-        }
-
+        self.check_owner(header)?;
         self.transfer.encrypt(secret, self.path.clone())
     }
 }

@@ -1,5 +1,5 @@
 use jiff::Timestamp;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, ffi::CStr, mem::MaybeUninit, ptr, sync::Arc};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
@@ -29,6 +29,7 @@ use crate::{
 use super::{
     secret_transfer::Secret,
     session::Session,
+    unlock_grants::{Target, UnlockGrants},
     utils::{secret_alias_path, secret_path, time_to_int, try_interface, EMPTY_PATH},
 };
 
@@ -224,11 +225,19 @@ pub struct Item<'a> {
     pub auth_gate: AuthGate,
     pub last_access: Arc<RwLock<Option<SecretAccessor<'static>>>>,
     pub notify_on_access: bool,
+    pub grants: UnlockGrants,
 }
 
 impl<'a> Item<'a> {
     fn path(&'_ self) -> ObjectPath<'_> {
         secret_path(&*self.collection_id, &*self.id).unwrap()
+    }
+
+    pub fn target(&self) -> Target {
+        Target::Item {
+            collection: self.collection_id.clone(),
+            item: self.id.clone(),
+        }
     }
 
     async fn broadcast_collection_signal(&self, connection: &Connection, name: &str) -> Result {
@@ -248,11 +257,17 @@ impl<'a> Item<'a> {
         session: &InterfaceDeref<'_, Session>,
         connection: &Connection,
     ) -> Result<Secret> {
+        // fail before consuming a grant or asking for approval
+        session.check_owner(header)?;
         let access_info = access_info_from_header(header, connection).await?;
-        let secret_key = self
-            .auth_gate
-            .request_secret_key(access_info.as_ref())
-            .await?;
+        let secret_key = secret_key_for(
+            &self.auth_gate,
+            &self.grants,
+            header,
+            &[self.target()],
+            access_info.as_ref(),
+        )
+        .await?;
 
         self.read_with_session_and_key(header, session, connection, &secret_key, access_info)
             .await
@@ -305,6 +320,33 @@ pub(crate) async fn access_info_from_header(
         Ok(Some(SecretAccessor::from_dbus_name(connection, id).await?))
     } else {
         Ok(Some(SecretAccessor::for_unknown_caller()))
+    }
+}
+
+/// The secret key from the caller's unlock grant, or else a blocking phone
+/// approval (bounded by the client's D-Bus timeout, typically 25s), which is
+/// cancelled if the caller leaves the bus.
+pub(crate) async fn secret_key_for(
+    auth_gate: &AuthGate,
+    grants: &UnlockGrants,
+    header: &Header<'_>,
+    targets: &[Target],
+    access_info: Option<&SecretAccessor<'_>>,
+) -> Result<SecureKey> {
+    let Some(sender) = header.sender() else {
+        return auth_gate.request_secret_key(access_info).await;
+    };
+    if let Some(key) = grants.take(sender, targets) {
+        debug!("Using unlock grant for {sender}");
+        return Ok(key);
+    }
+    let gone = grants.disconnected(sender.as_str());
+    tokio::select! {
+        result = auth_gate.request_secret_key(access_info) => result,
+        () = gone => {
+            info!("{sender} left the bus; cancelled its approval request");
+            Err(Error::PermissionDenied)
+        }
     }
 }
 
@@ -435,18 +477,23 @@ impl Item<'static> {
                 .unwrap_or_else(|| "[unknown ID]".into())
         );
 
-        let access_info = access_info_from_header(&header, connection).await?;
-        let secret_key = self
-            .auth_gate
-            .request_secret_key(access_info.as_ref())
-            .await?;
-
+        // decrypt first so an invalid secret never consumes a grant
         let secret_value =
             try_interface(object_server.interface::<_, Session>(&secret.session).await)?
                 .ok_or(Error::InvalidSession)?
                 .get()
                 .await
                 .decrypt(secret, &header)?;
+
+        let access_info = access_info_from_header(&header, connection).await?;
+        let secret_key = secret_key_for(
+            &self.auth_gate,
+            &self.grants,
+            &header,
+            &[self.target()],
+            access_info.as_ref(),
+        )
+        .await?;
 
         self.store
             .set_secret(&*self.collection_id, &*self.id, secret_value, &secret_key)
@@ -458,9 +505,11 @@ impl Item<'static> {
         Ok(())
     }
 
+    /// Unlocked while any client holds a grant for this item: property getters
+    /// cannot see the caller, so this is global rather than per-client.
     #[zbus(property)]
     async fn locked(&self) -> bool {
-        false
+        !self.grants.covered_by_anyone(&self.target())
     }
 
     #[zbus(property)]

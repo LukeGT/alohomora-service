@@ -56,6 +56,25 @@ The subcommand is optional; ommitting it defaults to `run-service`.
 
 Set `ALOHOMORA_AUTH_TIMEOUT_SECS` (integer seconds, 1-3600, default 60) to control how long the service waits for a mobile approval before failing the request. Invalid values abort startup with a configuration error.
 
+### Unlocking and prompts
+
+Reading a secret needs a phone approval, which can take far longer than the 25 second timeout libsecret (GDBus) applies to a single D-Bus method call. Items and collections are therefore reported as locked and approval goes through the standard Secret Service prompt flow:
+
+1. `SearchItems` lists matching items as locked.
+2. `Unlock(objects)` returns a prompt object (`/org/freedesktop/secrets/prompt/<id>`) without waiting.
+3. `Prompt.Prompt(window_id)` replies immediately; the approval request is sent once that reply is on the wire. Only the D-Bus connection that called `Unlock` may use the prompt, and each prompt can only be started once (one push per prompt). A prompt that is never started is removed after 60 seconds, and a client may have at most 8 outstanding prompts.
+4. `Prompt.Completed(dismissed, ao)` is emitted when the request is approved (`dismissed = false`) or when it fails (`dismissed = true`, empty result): it times out after `ALOHOMORA_AUTH_TIMEOUT_SECS`, or immediately if no device could be notified. There is no explicit deny: declining on the phone just lets the request time out. `Prompt.Dismiss` cancels the pending request, and so does the client disconnecting (for example, pressing Enter in the sudo hook to use a password instead).
+5. An approval becomes a **single-use grant** for that connection's unique name and the approved objects. A collection grant covers its items, so `Unlock(item)` after `Unlock(collection)` returns without another prompt. The first `GetSecrets`, `Item.GetSecret`, `CreateItem` or `SetSecret` covered by the grant consumes it; the next read needs a new approval. A grant that nobody claims is discarded after 10 seconds. Grants are also dropped when their client disconnects, and any `Lock` call (from any client) on an overlapping item or collection revokes them.
+
+`Item.Locked` and `Collection.Locked` are now `true` by default. They are `false` only while some connection holds an unclaimed grant for the object, because property getters cannot tell who is asking. `SearchItems` reports items as unlocked only for the caller holding the grant.
+
+What this means for clients:
+
+- libsecret (`secret-tool lookup`/`store`, Chrome) unlocks automatically and works as before, now with no 25 second limit on approval.
+- `secret-tool search` without `--unlock` lists only the attributes of locked items and no longer prints secrets.
+- Clients that check `Locked` themselves must call `Unlock` first. Python `secretstorage`, for example, raises `LockedException` from `Item.get_secret()` and `Collection.create_item()` unless the item or collection was unlocked (as the `keyring` package does) just before.
+- Clients that skip `Unlock` and call `GetSecrets`/`GetSecret`/`CreateItem`/`SetSecret` directly still work: the call blocks until the phone approval arrives, so it is limited by the client's method-call timeout (25 seconds for libsecret). The pending request is cancelled if the client disconnects.
+
 ### Access notifications (`--notify-on-access`)
 
 Pass `-n` / `--notify-on-access` to send a desktop notification via `org.freedesktop.Notifications` every time a secret value is read. Each notification includes the secret label, the accessing application name, its PID, and UID.
