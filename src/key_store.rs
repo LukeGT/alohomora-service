@@ -846,7 +846,7 @@ mod tests {
         }
     }
 
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::test_support::ENV_LOCK as ENV_MUTEX;
 
     #[tokio::test]
     async fn test_initialize_fails_when_setup_incomplete() {

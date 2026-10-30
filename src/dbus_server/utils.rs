@@ -28,6 +28,9 @@ pub fn alias_path<T: Display>(alias: T) -> Option<ObjectPath<'static>> {
 pub fn session_path<T: Display>(session_id: T) -> Option<ObjectPath<'static>> {
     ObjectPath::try_from(format!("/org/freedesktop/secrets/session/{session_id}")).ok()
 }
+pub fn prompt_path<T: Display>(prompt_id: T) -> Option<ObjectPath<'static>> {
+    ObjectPath::try_from(format!("/org/freedesktop/secrets/prompt/{prompt_id}")).ok()
+}
 pub fn try_interface<T>(result: zbus::Result<T>) -> zbus::Result<Option<T>> {
     match result {
         Ok(v) => Ok(Some(v)),
