@@ -18,8 +18,9 @@ use crate::{
 };
 
 use super::{
-    item::{access_info_from_header, Item},
+    item::{access_info_from_header, secret_key_for, Item},
     session::Session,
+    unlock_grants::{Target, UnlockGrants},
     utils::{
         alias_path, collection_path, secret_alias_path, secret_path, time_to_int, try_interface,
         EMPTY_PATH,
@@ -32,9 +33,14 @@ pub struct Collection<'a> {
     pub id: Arc<String>,
     pub auth_gate: AuthGate,
     pub notify_on_access: bool,
+    pub grants: UnlockGrants,
 }
 
 impl<'a> Collection<'a> {
+    fn target(&self) -> Target {
+        Target::Collection(self.id.clone())
+    }
+
     fn make_item(&self, id: String) -> Item<'a> {
         Item {
             id: Arc::new(id),
@@ -43,6 +49,7 @@ impl<'a> Collection<'a> {
             auth_gate: self.auth_gate.clone(),
             last_access: Default::default(),
             notify_on_access: self.notify_on_access,
+            grants: self.grants.clone(),
         }
     }
 
@@ -209,18 +216,23 @@ impl Collection<'static> {
         #[zbus(connection)] connection: &Connection,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(ObjectPath<'_>, ObjectPath<'_>)> {
-        let access_info = access_info_from_header(&header, connection).await?;
-        let secret_key = self
-            .auth_gate
-            .request_secret_key(access_info.as_ref())
-            .await?;
-
+        // decrypt first so an invalid secret never consumes a grant
         let secret_value =
             try_interface(object_server.interface::<_, Session>(&secret.session).await)?
                 .ok_or(Error::InvalidSession)?
                 .get()
                 .await
                 .decrypt(secret, &header)?;
+
+        let access_info = access_info_from_header(&header, connection).await?;
+        let secret_key = secret_key_for(
+            &self.auth_gate,
+            &self.grants,
+            &header,
+            &[self.target()],
+            access_info.as_ref(),
+        )
+        .await?;
 
         let label = properties
             .get("org.freedesktop.Secret.Item.Label")
@@ -317,8 +329,8 @@ impl Collection<'static> {
 
     #[zbus(property)]
     async fn locked(&self) -> bool {
-        // the collection does not need to be unlocked for it to be used. gpg will prompt automatically
-        false
+        // global, like Item.Locked: getters cannot see the caller
+        !self.grants.covered_by_anyone(&self.target())
     }
 
     #[zbus(property)]

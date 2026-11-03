@@ -1,6 +1,8 @@
 //! End-to-end test of the local (virtual) device flow against a real HTTP
 //! server on loopback, using a temporary key dir (never the real one).
 
+mod common;
+
 use std::{
     net::SocketAddr,
     sync::{
@@ -14,11 +16,9 @@ use axum::{http::HeaderMap, routing::post, Router};
 use pass_secret_service::{
     auth_gate::{AuthGate, LocalChallenge},
     config::AppConfig,
-    http_server::{self, KeychainInfo},
-    key_store::{self, ServiceIdentity},
+    http_server,
     local_device::{self, KdfParams},
 };
-use uuid::Uuid;
 
 #[tokio::test]
 async fn local_device_register_unlock_round_trip() {
@@ -54,44 +54,15 @@ async fn local_device_register_unlock_round_trip() {
         use_relay: false,
         authorization_timeout: std::time::Duration::from_secs(60),
     };
-    let identity = ServiceIdentity {
-        service_uuid: Uuid::new_v4().to_string(),
-        service_name: "Test Host".into(),
-    };
-    key_store::write_service_identity(&key_dir, &identity)
-        .await
-        .unwrap();
-    let local_key = key_store::generate_random_secret_key().unwrap();
-    let secret_key = key_store::generate_random_secret_key().unwrap();
+    let common::RegisteredDevice {
+        local_key,
+        secret_key,
+        device_key,
+        device_uuid,
+        ..
+    } = common::register_local_device(&key_dir, &config).await;
     let mut expected_secret = [0u8; 32];
     secret_key.unlock(|k| expected_secret.copy_from_slice(k));
-
-    // Registration through the same path as Android devices (pairing token).
-    let token =
-        key_store::create_temp_pairing_key(&key_dir, &local_key, &secret_key, &config, &identity)
-            .await
-            .unwrap();
-    let device_key = local_device::generate_device_key().unwrap();
-    let device_uuid = Uuid::new_v4();
-    let request = local_device::build_register_request(
-        &device_uuid,
-        KeychainInfo {
-            domain: config.domain.clone(),
-            port: config.external_port,
-            service_uuid: identity.service_uuid.clone(),
-            service_name: identity.service_name.clone(),
-        },
-        &token.value,
-        local_device::public_key_info(&device_key).unwrap(),
-    );
-    http_server::process_register_request(&local_key, request)
-        .await
-        .unwrap();
-    assert!(key_dir
-        .join(format!(
-            "device-keys/local/{device_uuid}/enc_secret_key.bin"
-        ))
-        .exists());
 
     // The password-protected key file lives beside the registration.
     let key_file = local_device::encrypt_private_key(

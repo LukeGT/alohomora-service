@@ -62,6 +62,9 @@ zeroize = "1"
 uuid = { version = "1.11.0", features = ["v4"] }
 zbus = { version = "4.3.1", default-features = false, features = ["tokio"] }
 
+[dev-dependencies]
+tokio = { version = "1.38.1", features = ["test-util"] }
+
 [profile.release]
 strip = true
 opt-level = "z"
@@ -73,3 +76,17 @@ incremental = false
 
 [profile.dev.package."*"]
 debug = 0
+
+# RSA key generation is far too slow unoptimised (seconds per request), which
+# makes D-Bus integration tests time out under load.
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+
+[profile.dev.package.rsa]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.sha1]
+opt-level = 3

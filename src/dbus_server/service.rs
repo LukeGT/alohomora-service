@@ -5,7 +5,7 @@ use std::{
 };
 
 use dyn_clone::clone_box;
-use log::debug;
+use log::{debug, info};
 use nanoid::nanoid;
 use zbus::{
     fdo, interface,
@@ -27,12 +27,14 @@ use crate::{
 
 use super::{
     collection::Collection,
-    item::{access_info_from_header, Item},
+    item::{access_info_from_header, secret_key_for, Item},
+    prompt::{watch_disconnects, Prompt, PromptRegistry, PromptRequest, MAX_PROMPTS_PER_CALLER},
     secret_transfer::{PlainTextTransfer, Secret},
     session::Session,
+    unlock_grants::{Target, UnlockGrants},
     utils::{
-        alias_path, collection_path, secret_alias_path, secret_path, session_path, try_interface,
-        EMPTY_PATH,
+        alias_path, collection_path, prompt_path, secret_alias_path, secret_path, session_path,
+        try_interface, EMPTY_PATH,
     },
 };
 
@@ -45,6 +47,8 @@ pub struct Service<'a> {
     auth_gate: AuthGate,
     forget_password_on_lock: bool,
     notify_on_access: bool,
+    grants: UnlockGrants,
+    prompts: PromptRegistry,
 }
 
 impl Service<'static> {
@@ -56,6 +60,9 @@ impl Service<'static> {
         notify_on_access: bool,
     ) -> Result<Self> {
         let store = Box::new(RedbSecretStore::new(pass).await?);
+        let grants = UnlockGrants::default();
+        let prompts = PromptRegistry::default();
+        watch_disconnects(&connection, prompts.clone(), grants.clone()).await?;
 
         {
             let object_server = connection.object_server();
@@ -88,6 +95,7 @@ impl Service<'static> {
                         collection_id: collection_id.clone(),
                         last_access: Default::default(),
                         notify_on_access,
+                        grants: grants.clone(),
                     })
                     .collect();
 
@@ -103,6 +111,7 @@ impl Service<'static> {
                     id: collection_id,
                     auth_gate: auth_gate.clone(),
                     notify_on_access,
+                    grants: grants.clone(),
                 };
 
                 // add the aliases
@@ -127,6 +136,8 @@ impl Service<'static> {
             auth_gate,
             forget_password_on_lock,
             notify_on_access,
+            grants,
+            prompts,
         })
     }
 
@@ -136,7 +147,19 @@ impl Service<'static> {
             store: clone_box(self.store.as_ref()),
             auth_gate: self.auth_gate.clone(),
             notify_on_access: self.notify_on_access,
+            grants: self.grants.clone(),
         }
+    }
+
+    /// Reduce an item or collection path (including alias paths) to a target.
+    async fn resolve_target(object_server: &ObjectServer, path: &ObjectPath<'_>) -> Result<Target> {
+        if let Some(item) = try_interface(object_server.interface::<_, Item>(path).await)? {
+            return Ok(item.get().await.target());
+        }
+        let collection = try_interface(object_server.interface::<_, Collection>(path).await)?
+            .into_not_found()?;
+        let id = collection.get().await.id.clone();
+        Ok(Target::Collection(id))
     }
 }
 
@@ -253,49 +276,53 @@ impl Service<'static> {
     async fn search_items(
         &'_ self,
         attributes: HashMap<String, String>,
+        #[zbus(header)] header: Header<'_>,
     ) -> Result<(Vec<ObjectPath<'_>>, Vec<ObjectPath<'_>>)> {
         let items = self.store.search_all_collections(attributes).await?;
-        let paths = items
-            .into_iter()
-            .flat_map(|(col, secrets)| {
-                secrets
-                    .into_iter()
-                    .filter_map(move |secret| secret_path(&col, &secret))
-            })
-            .collect();
-        // we don't support locking
-        Ok((paths, vec![]))
+        let caller = header.sender();
+        let (mut unlocked, mut locked) = (vec![], vec![]);
+        for (collection, secrets) in items {
+            let collection = Arc::new(collection);
+            for secret in secrets {
+                let Some(path) = secret_path(&*collection, &secret) else {
+                    continue;
+                };
+                let target = Target::Item {
+                    collection: collection.clone(),
+                    item: Arc::new(secret),
+                };
+                // items count as unlocked only for the client holding the grant
+                if caller.is_some_and(|c| self.grants.covers(c, &[target])) {
+                    unlocked.push(path);
+                } else {
+                    locked.push(path);
+                }
+            }
+        }
+        Ok((unlocked, locked))
     }
 
     async fn lock(
         &'_ self,
         objects: Vec<OwnedObjectPath>,
         #[zbus(object_server)] object_server: &ObjectServer,
-    ) -> Result<(Vec<ObjectPath<'_>>, ObjectPath<'_>)> {
+    ) -> Result<(Vec<OwnedObjectPath>, ObjectPath<'_>)> {
+        let mut targets = Vec::with_capacity(objects.len());
+        for object_path in &objects {
+            targets.push(Self::resolve_target(object_server, object_path).await?);
+        }
+        self.grants.revoke(&targets);
+
         if self.forget_password_on_lock {
             // all parent collection directories for the items given
-            let mut collection_dirs = HashSet::<PathBuf>::new();
-
-            for object_path in objects {
-                collection_dirs.insert(
-                    match try_interface(object_server.interface::<_, Item>(&object_path).await)? {
-                        Some(item) => {
-                            // this object is an item
-                            get_collection_dir(&*item.get().await.collection_id)
-                        }
-                        None => {
-                            // this might be a collection
-                            let collection = try_interface(
-                                object_server.interface::<_, Collection>(&object_path).await,
-                            )?
-                            .into_not_found()?;
-                            let collection_dir = get_collection_dir(&*collection.get().await.id);
-                            // this is just to satisfy the borrow checker
-                            collection_dir
-                        }
-                    },
-                );
-            }
+            let collection_dirs: HashSet<PathBuf> = targets
+                .iter()
+                .map(|target| match target {
+                    Target::Collection(id) | Target::Item { collection: id, .. } => {
+                        get_collection_dir(id)
+                    }
+                })
+                .collect();
             debug!(
                 "Locking collections [{}]",
                 collection_dirs
@@ -310,16 +337,67 @@ impl Service<'static> {
                 .await?;
         };
 
-        // we return an empty array here because no items are ever actually locked - they can be accessed without being unlocked
-        Ok((vec![], EMPTY_PATH))
+        Ok((objects, EMPTY_PATH))
     }
 
+    /// Unlocking needs a phone approval, which can take far longer than a
+    /// D-Bus method call may block, so it goes through a Prompt object whose
+    /// approval becomes a single-use grant for this caller.
     async fn unlock(
         &'_ self,
         objects: Vec<OwnedObjectPath>,
-    ) -> (Vec<OwnedObjectPath>, ObjectPath<'_>) {
-        // we don't support locking - just say all of them were unlocked
-        (objects, EMPTY_PATH)
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(object_server)] object_server: &ObjectServer,
+        #[zbus(connection)] connection: &Connection,
+    ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath)> {
+        if objects.is_empty() {
+            return Ok((vec![], EMPTY_PATH.into()));
+        }
+        let caller = header.sender().ok_or(Error::PermissionDenied)?.to_owned();
+
+        let mut targets = Vec::with_capacity(objects.len());
+        for object_path in &objects {
+            targets.push(Self::resolve_target(object_server, object_path).await?);
+        }
+
+        if self.grants.covers(&caller, &targets) {
+            debug!("Unlock for {caller}: already covered by a grant");
+            return Ok((objects, EMPTY_PATH.into()));
+        }
+
+        let (covered, remaining): (Vec<_>, Vec<_>) = objects
+            .iter()
+            .cloned()
+            .zip(&targets)
+            .partition(|(_, target)| self.grants.covers(&caller, std::slice::from_ref(*target)));
+        let covered = covered.into_iter().map(|(p, _)| p).collect();
+        let remaining = remaining.into_iter().map(|(p, _)| p).collect();
+
+        if self.prompts.count_for(caller.as_str()) >= MAX_PROMPTS_PER_CALLER {
+            return Err(Error::InvalidRequest(
+                "too many outstanding prompts for this client".into(),
+            ));
+        }
+        let accessor = access_info_from_header(&header, connection).await?;
+        let path: OwnedObjectPath = prompt_path(nanoid!(8, &NANOID_ALPHABET)).unwrap().into();
+        let path = Prompt::register(
+            PromptRequest {
+                path,
+                caller: caller.clone().into(),
+                targets,
+                result: remaining,
+                accessor,
+            },
+            self.auth_gate.clone(),
+            self.grants.clone(),
+            self.prompts.clone(),
+            connection,
+            object_server,
+        )
+        .await?;
+        info!("Unlock for {caller} needs approval via prompt {path}");
+
+        Ok((covered, path))
     }
 
     async fn get_secrets(
@@ -336,17 +414,32 @@ impl Service<'static> {
         if items.is_empty() {
             return Ok(HashMap::new());
         }
-        let access_info = access_info_from_header(&header, connection).await?;
-        let secret_key = self
-            .auth_gate
-            .request_secret_key(access_info.as_ref())
-            .await?;
+        // fail before consuming a grant or asking for approval
+        session.check_owner(&header)?;
 
-        let mut results = HashMap::with_capacity(items.len());
-
+        let mut resolved = Vec::with_capacity(items.len());
+        let mut targets = Vec::with_capacity(items.len());
         for item_path in items {
             let item_ref = try_interface(object_server.interface::<_, Item>(&item_path).await)?
                 .into_not_found()?;
+            targets.push(item_ref.get().await.target());
+            resolved.push((item_path, item_ref));
+        }
+
+        let access_info = access_info_from_header(&header, connection).await?;
+        // without a prior Unlock this blocks within the client's D-Bus timeout
+        let secret_key = secret_key_for(
+            &self.auth_gate,
+            &self.grants,
+            &header,
+            &targets,
+            access_info.as_ref(),
+        )
+        .await?;
+
+        let mut results = HashMap::with_capacity(resolved.len());
+
+        for (item_path, item_ref) in resolved {
             let secret = item_ref
                 .get()
                 .await

@@ -31,3 +31,7 @@ impl Drop for TempDir {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+/// Serialises unit tests that change process-wide environment variables
+/// such as `ALOHOMORA_KEY_DIR`.
+pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
