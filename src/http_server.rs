@@ -219,9 +219,17 @@ pub async fn spawn_setup_server(
     config: AppConfig,
     local_key: key_store::SecureKey,
     done_tx: std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
-) -> Result<JoinHandle<()>> {
-    let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.internal_port));
+) -> Result<(JoinHandle<()>, SocketAddr)> {
+    // Relay mode: the phone registers through the relay and the local device uses loopback, so
+    // the kernel picks a free port (the running service already holds `internal_port`).
+    // Direct mode: a phone connects to the forwarded `internal_port`, so it must stay fixed.
+    let addr = if config.use_relay {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
+    } else {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.internal_port))
+    };
     let listener = TcpListener::bind(addr).await?;
+    let addr = listener.local_addr()?;
     info!(
         "Alohomora Setup HTTP server listening on {} for {}:{}",
         addr, config.domain, config.external_port
@@ -233,11 +241,12 @@ pub async fn spawn_setup_server(
         .route("/alohomora/register", post(register_setup))
         .with_state(state);
 
-    Ok(tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
             error!("Alohomora Setup HTTP server failed: {err}");
         }
-    }))
+    });
+    Ok((handle, addr))
 }
 
 pub async fn process_register_request(
