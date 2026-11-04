@@ -23,6 +23,7 @@ explain() {
         # root this write could append to any file it had opened with O_PATH. The group must be the
         # user's too, or the kernel refuses access to the caller's /proc entry.
         local user="${PAM_RUSER:-${PAM_USER:-nobody}}"
+        # shellcheck disable=SC2016 # $1 and $2 expand in the inner sh, on purpose
         setpriv --reuid="$(id -u "$user")" --regid="$(id -g "$user")" --clear-groups \
             sh -c 'echo "Alohomora: $1, and there is no terminal for password authentication." >> "$2"' \
             sh "$1" "/proc/$(ps -o ppid= -p "$PPID" | tr -d ' ')/fd/2" 2>/dev/null

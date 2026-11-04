@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86-64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Includes the pam/ script tests (tests/pam_install.rs, tests/sudo_auth.rs).
+      - name: cargo test
+        run: cargo test --all-targets
+      # Warnings are not denied yet: the tree has ~200 existing ones. Clippy's deny-by-default
+      # lints still fail the build.
+      - name: cargo clippy
+        run: cargo clippy --all-targets
+
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --check
+      - name: shellcheck
+        run: shellcheck pam/*.sh pam/sudo-alohomora-auth
+
+  # Single stable name for the branch ruleset to require.
+  ci:
+    name: ci
+    if: always()
+    needs: [test, lint]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: All jobs passed
+        run: test "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "false"
