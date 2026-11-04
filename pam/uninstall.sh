@@ -1,60 +1,72 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Must be run with root / sudo
-if [ "$(id -u)" -ne 0 ]; then
+# Restores standard sudo and removes the PAM helper. The service (its binaries and unit) stays
+# installed: other secret-service clients depend on it, and this may run as a dead-man rollback.
+# Usage (as root): uninstall.sh [--prefix DIR]   (--prefix: under DIR, without root or visudo; tests)
+
+umask 022
+
+PREFIX=""
+if [[ "${1:-}" == "--prefix" ]]; then PREFIX="${2:?}"; fi
+if [[ -z "${PREFIX}" && "$(id -u)" -ne 0 ]]; then
     echo "Error: uninstall.sh must be run as root (e.g. sudo ./uninstall.sh)" >&2
     exit 1
 fi
 
 echo "Uninstalling Alohomora sudo authentication..."
 
-# 1. Restore /etc/pam.d/sudo
-if [ -L /etc/pam.d/sudo ]; then
-    echo "Removing symlink /etc/pam.d/sudo..."
-    rm -f /etc/pam.d/sudo
-    if [ -f /etc/pam.d/sudo.orig ]; then
+# 1. Restore /etc/pam.d/sudo. Only replace ours (a link from an older install, or our copy).
+PAM="${PREFIX}/etc/pam.d/sudo"
+if [[ -L "${PAM}" ]] || grep -q sudo-alohomora-auth "${PAM}" 2>/dev/null; then
+    if [[ -f "${PAM}.orig" ]]; then
         echo "Restoring /etc/pam.d/sudo from backup..."
-        cp -p /etc/pam.d/sudo.orig /etc/pam.d/sudo
-        rm -f /etc/pam.d/sudo.orig
-    elif [ -f /etc/pam.d/sudo.bak ]; then
+        cp -p "${PAM}.orig" "${PAM}.new"
+    elif [[ -f "${PAM}.bak" ]]; then
         echo "Restoring /etc/pam.d/sudo from .bak..."
-        cp -p /etc/pam.d/sudo.bak /etc/pam.d/sudo
+        cp -p "${PAM}.bak" "${PAM}.new"
+    else
+        # Never leave sudo without a PAM file: it would deny everyone.
+        echo "No backup; writing the stock password-only /etc/pam.d/sudo..."
+        cat >"${PAM}.new" <<'STOCK'
+#%PAM-1.0
+session    required   pam_limits.so
+session    required   pam_env.so readenv=1 user_readenv=0
+session    required   pam_env.so readenv=1 envfile=/etc/default/locale user_readenv=0
+@include common-auth
+@include common-account
+@include common-session-noninteractive
+STOCK
+        chmod 0644 "${PAM}.new"
     fi
+    mv -Tf "${PAM}.new" "${PAM}"
+    rm -f "${PAM}.orig"
 fi
 
 # 2. Restore /etc/sudoers.d/90-cloud-init-users
-if [ -f /etc/sudoers.d/90-cloud-init-users.orig ]; then
-    echo "Restoring /etc/sudoers.d/90-cloud-init-users from backup..."
-    cp -p /etc/sudoers.d/90-cloud-init-users.orig /etc/sudoers.d/90-cloud-init-users
-    chmod 0440 /etc/sudoers.d/90-cloud-init-users
-    chown root:root /etc/sudoers.d/90-cloud-init-users
-    rm -f /etc/sudoers.d/90-cloud-init-users.orig
-elif [ -f /etc/sudoers.d/90-cloud-init-users.bak ]; then
-    echo "Restoring /etc/sudoers.d/90-cloud-init-users from .bak..."
-    cp -p /etc/sudoers.d/90-cloud-init-users.bak /etc/sudoers.d/90-cloud-init-users
-    chmod 0440 /etc/sudoers.d/90-cloud-init-users
-    chown root:root /etc/sudoers.d/90-cloud-init-users
-fi
+SUDOERS="${PREFIX}/etc/sudoers.d/90-cloud-init-users"
+for backup in "${SUDOERS}.orig" "${SUDOERS}.bak"; do
+    if [[ -f "${backup}" ]]; then
+        echo "Restoring /etc/sudoers.d/90-cloud-init-users from ${backup##*.}..."
+        cp -p "${backup}" "${SUDOERS}.new"
+        chmod 0440 "${SUDOERS}.new"
+        [[ -n "${PREFIX}" ]] || chown root:root "${SUDOERS}.new"
+        mv -Tf "${SUDOERS}.new" "${SUDOERS}"
+        [[ "${backup}" != *.orig ]] || rm -f "${backup}"
+        break
+    fi
+done
 
 # 3. Validate sudoers syntax
-if ! visudo -c; then
+if [[ -z "${PREFIX}" ]] && ! visudo -c >/dev/null; then
     echo "Warning: visudo check reported issues!" >&2
 fi
 
-# 4. Remove /usr/local/bin/sudo-alohomora-auth symlink
-if [ -L /usr/local/bin/sudo-alohomora-auth ]; then
-    echo "Removing /usr/local/bin/sudo-alohomora-auth symlink..."
-    rm -f /usr/local/bin/sudo-alohomora-auth
-fi
-
-# 5. Optionally remove /usr/local/bin/sudo-auth symlink if it points to secret-tool
-if [ -L /usr/local/bin/sudo-auth ]; then
-    TARGET=$(readlink -f /usr/local/bin/sudo-auth 2>/dev/null || true)
-    if [ "$TARGET" = "/usr/bin/secret-tool" ]; then
-        echo "Removing /usr/local/bin/sudo-auth symlink..."
-        rm -f /usr/local/bin/sudo-auth
-    fi
+# 4. Remove the helper, its client, and anything an older install left behind
+rm -f "${PREFIX}/usr/local/lib/alohomora/sudo-alohomora-auth" \
+      "${PREFIX}/usr/local/bin/sudo-alohomora-auth"
+if [[ -L "${PREFIX}/usr/local/bin/sudo-auth" ]]; then
+    rm -f "${PREFIX}/usr/local/bin/sudo-auth"
 fi
 
 echo "Alohomora sudo authentication uninstalled successfully!"

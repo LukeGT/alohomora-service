@@ -8,7 +8,8 @@ Alohomora requires root privileges to access `/var/lib/alohomora-service` and de
    - System-wide systemd unit (`/etc/systemd/system/alohomora-service.service`).
    - Runs as `User=root`.
    - Points `DBUS_SESSION_BUS_ADDRESS` to the user session bus socket (`unix:path=/run/user/1000/bus`).
-   - Points `PASSWORD_STORE_DIR`, `GNUPGHOME`, and `HOME` to the target user's directories (`/home/ubuntu/.password-store`, `/home/ubuntu/.gnupg`).
+   - Points `PASSWORD_STORE_DIR` at the target user's store. `GNUPGHOME` and `HOME` are root-only (`/var/lib/alohomora-service`), since `gpg` run as root obeys the config in its home.
+   - Runs `/usr/local/lib/alohomora/pass-secret-service`, and holds the sudo approval socket in `/run/alohomora`.
    - Leaves `ALOHOMORA_DOMAIN` unset so the default `alohomora.app` relay is used (do not set it to a custom domain, or the daemon stops polling the relay and phone approvals fail with 404). Pushes go to the relay (`https://alohomora.app/send-notification`); the local `alohomora-web` service is deprecated, so `ALOHOMORA_NOTIFICATION_URL` is not set. Configures the internal port and `ALOHOMORA_AUTH_TIMEOUT_SECS` (how long to wait for a phone approval, in seconds; default 60, valid 1-3600; the unit sets 3600).
 
 2. **`dbus-session-local.conf`**:
@@ -26,15 +27,15 @@ Alohomora requires root privileges to access `/var/lib/alohomora-service` and de
 
 2. Install and enable the systemd service:
    ```sh
-   sudo cp systemd/alohomora-service.service /etc/systemd/system/alohomora-service.service
-   sudo systemctl daemon-reload
+   cargo build --release
+   sudo pam/install.sh --service-only   # root-owned copies of the binaries and this unit; see pam/README.md
    sudo systemctl enable alohomora-service
    ```
 
 3. Pair with your mobile device first using `alohomora-setup` before starting the service:
    ```sh
    sudo env ALOHOMORA_INTERNAL_PORT=19969 \
-            /path/to/target/release/alohomora-setup
+            /usr/local/lib/alohomora/alohomora-setup
    ```
 
 4. Start `alohomora-service`:

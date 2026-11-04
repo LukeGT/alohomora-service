@@ -23,6 +23,10 @@ path = "src/bin/local_device.rs"
 name = "alohomora-unlock"
 path = "src/bin/unlock.rs"
 
+[[bin]]
+name = "alohomora-sudo-approve"
+path = "src/bin/sudo_approve.rs"
+
 [dependencies]
 aes = "0.8.4"
 aes-gcm = "0.10.3"

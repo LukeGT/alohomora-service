@@ -1,9 +1,9 @@
-#!/bin/bash
+#!/bin/bash -p
 set -u
 
-TARGET_USER="${PAM_USER:-ubuntu}"
-TARGET_UID="$(id -u "$TARGET_USER" 2>/dev/null || echo 1000)"
-export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${TARGET_UID}/bus"
+# Runs as root on sudo's behalf: trust nothing inherited. -p above ignores BASH_ENV.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+unset IFS CDPATH GLOBIGNORE ENV
 
 # Identify the user's terminal. This must match the guard in pam-sudo (PAM_TTY is a /dev path);
 # sudo-rs sets PAM_TTY only when it has a tty, and aborts if a PAM message arrives without one.
@@ -19,8 +19,13 @@ explain() {
     if [ -n "$TTY_DEV" ] && [ -w "$TTY_DEV" ]; then
         printf "\nAlohomora: %s; falling back to password authentication.\n" "$1" > "$TTY_DEV"
     else
-        echo "Alohomora: $1, and there is no terminal for password authentication." \
-            >> "/proc/$(ps -o ppid= -p "$PPID" | tr -d ' ')/fd/2" 2>/dev/null
+        # Reopened with the user's own rights: the caller chooses what this fd refers to, and as
+        # root this write could append to any file it had opened with O_PATH. The group must be the
+        # user's too, or the kernel refuses access to the caller's /proc entry.
+        local user="${PAM_RUSER:-${PAM_USER:-nobody}}"
+        setpriv --reuid="$(id -u "$user")" --regid="$(id -g "$user")" --clear-groups \
+            sh -c 'echo "Alohomora: $1, and there is no terminal for password authentication." >> "$2"' \
+            sh "$1" "/proc/$(ps -o ppid= -p "$PPID" | tr -d ' ')/fd/2" 2>/dev/null
     fi
 }
 
@@ -30,11 +35,11 @@ if ! systemctl is-active --quiet alohomora-service; then
     exit 1
 fi
 
-# Run the secret lookup in background as the invoking user
-/usr/local/bin/sudo-auth lookup service sudo >/dev/null 2>&1 &
+# Ask the daemon over its root-only socket; never the session bus, which the user controls.
+/usr/local/lib/alohomora/alohomora-sudo-approve >/dev/null 2>&1 &
 SECRET_PID=$!
 
-# Ensure background lookup is cleaned up on script exit
+# Ensure the background request is cleaned up on script exit
 trap 'kill "$SECRET_PID" 2>/dev/null; wait "$SECRET_PID" 2>/dev/null' EXIT INT TERM
 
 # If a valid terminal is available and accessible, prompt and monitor Enter key
