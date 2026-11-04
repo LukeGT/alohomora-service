@@ -2,8 +2,8 @@
 
 use crate::{process_cmdline::read_command_line, process_tree::ProcTree};
 
-/// `comm` of the PAM helper (a symlink to `secret-tool`) spawned by
-/// `sudo-alohomora-auth`. Its own command line says nothing useful.
+/// Caller name of the sudo approval client spawned by `sudo-alohomora-auth`
+/// (see `sudo_auth`). Its own command line says nothing useful.
 const SUDO_AUTH_COMM: &str = "sudo-auth";
 const SUDO_COMM: &str = "sudo";
 

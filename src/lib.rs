@@ -29,6 +29,7 @@ pub mod pass;
 pub mod process_cmdline;
 pub mod process_tree;
 pub mod secret_store;
+pub mod sudo_auth;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -54,6 +55,11 @@ pub async fn run(args: CliArgs) -> Result {
                 symmetric_gpg_passphrase,
             )?));
             let _http_server = http_server::spawn(config, auth_gate.clone()).await?;
+            // Before the session bus: sudo approval must not depend on it.
+            let _sudo_auth = sudo_auth::spawn(
+                auth_gate.clone(),
+                std::path::Path::new(sudo_auth::SOCKET_PATH),
+            )?;
 
             let connection = Connection::session().await?;
 
