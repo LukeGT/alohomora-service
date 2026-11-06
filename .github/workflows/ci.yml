@@ -61,8 +61,8 @@ jobs:
         run: shellcheck pam/*.sh pam/sudo-alohomora-auth
 
   # Single stable name for the branch ruleset to require.
-  ci:
-    name: ci
+  check:
+    name: check
     if: always()
     needs: [test, lint]
     runs-on: ubuntu-24.04
