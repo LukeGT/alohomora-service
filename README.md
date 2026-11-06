@@ -141,9 +141,9 @@ Registration reuses Safe Pairing, so it needs approval from an existing device f
    alohomora-local-device register --setup '<setup URL or token>' --server http://127.0.0.1:19969   # --setup can also be piped on stdin
    ```
 
-   You are prompted twice for an unlock password (min. 12 characters). A key pair is generated, the public key is registered with the name "Local Terminal Unlock" via the normal `POST /alohomora/register` route on the internal port (`ALOHOMORA_INTERNAL_PORT`, default 19969), and the encrypted private key is stored.
+   You are prompted twice for an unlock password (min. 12 characters). A key pair is generated, the public key is registered with the name "Local Terminal Unlock" via the normal `POST /alohomora/register` route on the setup server, and the encrypted private key is stored.
 
-   If the running service already holds the internal port (relay mode), the setup server cannot bind it; stop the service for the duration of registration or pass `--server` to a reachable setup server.
+   In relay mode the setup server binds a random free loopback port (the command printed by `alohomora-setup` already carries it), so the running service can stay up and keep approving `sudo` while you register. Without the relay it uses the internal port so a phone can reach it.
 
 ### Unlocking
 
