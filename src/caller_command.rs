@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    process_cmdline::{read_command_line, truncate_chars},
+    process_cmdline::read_command_line_uncapped,
     process_tree::{ChainEnd, ProcTree},
 };
 
@@ -21,6 +21,12 @@ pub struct ChainEntry {
     pub ppid: Option<u32>,
     pub comm: String,
     pub cmdline: String,
+    /// Characters (code points) cut from the sanitised cmdline, by the per-entry
+    /// cap and by size-budget shortening; 0 if nothing was cut. The kept text
+    /// then ends in a single `…` marker that is not counted as kept. If the
+    /// `/proc` read itself stopped at 4096 bytes, counting starts from what was read.
+    #[serde(default)]
+    pub truncated_chars: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,14 +45,16 @@ pub fn command_chain_for_caller(
     let (walked, end) = tree.walk(pid, MAX_CHAIN_ENTRIES);
     let mut entries: Vec<ChainEntry> = walked
         .into_iter()
-        .map(|e| ChainEntry {
-            pid: e.pid,
-            ppid: Some(e.ppid),
-            cmdline: truncate_chars(
-                read_command_line(tree.root(), e.pid),
-                MAX_ENTRY_CMDLINE_CHARS,
-            ),
-            comm: e.comm,
+        .map(|e| {
+            let (cmdline, truncated_chars) =
+                cap_cmdline(read_command_line_uncapped(tree.root(), e.pid));
+            ChainEntry {
+                pid: e.pid,
+                ppid: Some(e.ppid),
+                cmdline,
+                comm: e.comm,
+                truncated_chars,
+            }
         })
         .collect();
     if entries.is_empty() {
@@ -55,10 +63,23 @@ pub fn command_chain_for_caller(
             ppid: None,
             comm: process_name.unwrap_or_default().to_string(),
             cmdline: String::new(),
+            truncated_chars: 0,
         });
     }
     fit_budget(&mut entries);
     CommandChain { entries, end }
+}
+
+/// Apply the per-entry cap, returning the kept text and the chars cut.
+fn cap_cmdline(full: String) -> (String, u32) {
+    let total = full.chars().count();
+    if total <= MAX_ENTRY_CMDLINE_CHARS {
+        return (full, 0);
+    }
+    let kept = MAX_ENTRY_CMDLINE_CHARS - 1;
+    let mut text: String = full.chars().take(kept).collect();
+    text.push('…');
+    (text, (total - kept) as u32)
 }
 
 fn serialized_len(entries: &[ChainEntry]) -> usize {
@@ -83,8 +104,11 @@ fn fit_budget(entries: &mut [ChainEntry]) {
         let len = longest.cmdline.chars().count();
         let step = ((size - MAX_CHAIN_BYTES) / 4).max(1);
         let target = len.saturating_sub(step).max(1);
+        // The marker `…` of an already truncated entry is not kept text.
+        let prev_kept = len - usize::from(longest.truncated_chars > 0);
         let mut shortened: String = longest.cmdline.chars().take(target - 1).collect();
         shortened.push('…');
+        longest.truncated_chars += (prev_kept - (target - 1)) as u32;
         longest.cmdline = shortened;
     }
 }
@@ -199,6 +223,7 @@ mod tests {
                 pid: 100 - i,
                 ppid: Some(99 - i),
                 comm: "worker".into(),
+                truncated_chars: 0,
                 cmdline: if i % 2 == 0 {
                     "\u{4e2d}\u{6587}".repeat(100)
                 } else {
@@ -210,9 +235,85 @@ mod tests {
         fit_budget(&mut entries);
         assert!(serde_json::to_string(&entries).unwrap().len() <= MAX_CHAIN_BYTES);
         assert_eq!(entries.len(), 16);
-        for e in &entries {
+        for (i, e) in entries.iter().enumerate() {
             assert!(e.cmdline.ends_with('…'));
             assert_eq!(e.comm, "worker");
+            // kept chars (without the marker) plus cut chars is the original 200
+            assert_eq!(
+                e.cmdline.chars().count() - 1 + e.truncated_chars as usize,
+                200,
+                "{i}"
+            );
+        }
+    }
+
+    #[test]
+    fn untruncated_entries_report_zero() {
+        let dir = TempDir::new();
+        add(&dir, 1, "init", 0, b"init\0");
+        add(&dir, 5, "tool", 1, b"tool\0--flag\0");
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 5, None);
+        assert!(c.entries.iter().all(|e| e.truncated_chars == 0));
+    }
+
+    #[test]
+    fn per_entry_cap_counts_cut_chars_from_full_cmdline() {
+        let dir = TempDir::new();
+        add(&dir, 1, "init", 0, b"init\0");
+        // 500 chars: beyond the old 1000-char display cap is covered below
+        add(
+            &dir,
+            5,
+            "tool",
+            1,
+            format!("{}\0", "x".repeat(500)).as_bytes(),
+        );
+        add(
+            &dir,
+            6,
+            "big",
+            5,
+            format!("{}\0", "y".repeat(3000)).as_bytes(),
+        );
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 6, None);
+        assert_eq!(
+            c.entries[0].cmdline.chars().count(),
+            MAX_ENTRY_CMDLINE_CHARS
+        );
+        assert_eq!(c.entries[0].truncated_chars, 3000 - 199);
+        assert_eq!(c.entries[1].truncated_chars, 500 - 199);
+        assert_eq!(c.entries[2].truncated_chars, 0);
+    }
+
+    #[test]
+    fn proc_read_limit_is_the_counting_base() {
+        let dir = TempDir::new();
+        add(&dir, 1, "init", 0, b"init\0");
+        // /proc reads stop at 4096 bytes, so that is what gets counted
+        add(&dir, 5, "huge", 1, "z".repeat(10_000).as_bytes());
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 5, None);
+        assert_eq!(c.entries[0].truncated_chars, 4096 - 199);
+    }
+
+    #[test]
+    fn budget_shortening_adds_to_truncated_chars() {
+        let dir = TempDir::new();
+        // 16 entries of 900 chars: cap cuts 701 each, the budget cuts more
+        let long = format!("{}\0", "x".repeat(900));
+        for p in 1..=16u32 {
+            add(&dir, p, "worker", p - 1, long.as_bytes());
+        }
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 16, None);
+        for e in &c.entries {
+            assert_eq!(
+                e.cmdline.chars().count() - 1 + e.truncated_chars as usize,
+                900
+            );
+            assert!(e.truncated_chars > 701);
         }
     }
 

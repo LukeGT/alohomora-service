@@ -19,6 +19,16 @@ const REPLACEMENT: char = '\u{FFFD}';
 /// Read the command line of `pid` from the procfs at `proc_root`.
 /// Missing, unreadable or empty (kernel threads, zombies) yields an empty string.
 pub fn read_command_line(proc_root: &Path, pid: u32) -> String {
+    truncate_chars(
+        read_command_line_uncapped(proc_root, pid),
+        MAX_CMDLINE_CHARS,
+    )
+}
+
+/// Like [`read_command_line`] but without the character cap, so callers can
+/// count what they cut themselves. Only the byte limit of the `/proc` read
+/// ([`MAX_CMDLINE_READ_BYTES`]) still applies.
+pub fn read_command_line_uncapped(proc_root: &Path, pid: u32) -> String {
     let path = proc_root.join(pid.to_string()).join("cmdline");
     let Ok(file) = File::open(path) else {
         return String::new();
@@ -31,11 +41,15 @@ pub fn read_command_line(proc_root: &Path, pid: u32) -> String {
     {
         return String::new();
     }
-    format_command_line(&buf)
+    sanitise_command_line(&buf)
 }
 
 /// Turn raw NUL-separated `cmdline` bytes into a single safe display string.
 pub fn format_command_line(raw: &[u8]) -> String {
+    truncate_chars(sanitise_command_line(raw), MAX_CMDLINE_CHARS)
+}
+
+fn sanitise_command_line(raw: &[u8]) -> String {
     let args: Vec<_> = raw
         .split(|&b| b == 0)
         // trailing NUL yields one empty tail element; drop empties at the end only
@@ -49,7 +63,7 @@ pub fn format_command_line(raw: &[u8]) -> String {
         .map(|a| String::from_utf8_lossy(a))
         .collect::<Vec<_>>()
         .join(" ");
-    truncate_chars(neutralise(&joined), MAX_CMDLINE_CHARS)
+    neutralise(&joined)
 }
 
 fn is_bidi_or_separator(c: char) -> bool {

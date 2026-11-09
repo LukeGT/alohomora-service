@@ -1163,12 +1163,14 @@ mod tests {
                     ppid: Some(1),
                     comm: "tool".into(),
                     cmdline: "tool --flag value".into(),
+                    truncated_chars: 7,
                 },
                 ChainEntry {
                     pid: 1,
                     ppid: Some(0),
                     comm: "systemd".into(),
                     cmdline: String::new(),
+                    truncated_chars: 0,
                 },
             ],
             end: ChainEnd::Root,
@@ -1193,7 +1195,9 @@ mod tests {
         assert_eq!(json["command_chain"][0]["ppid"], 1);
         assert_eq!(json["command_chain"][0]["comm"], "tool");
         assert_eq!(json["command_chain"][0]["cmdline"], "tool --flag value");
+        assert_eq!(json["command_chain"][0]["truncated_chars"], 7);
         assert_eq!(json["command_chain"][1]["cmdline"], "");
+        assert_eq!(json["command_chain"][1]["truncated_chars"], 0);
     }
 
     #[test]
