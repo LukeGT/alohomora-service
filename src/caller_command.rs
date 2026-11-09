@@ -193,6 +193,30 @@ mod tests {
     }
 
     #[test]
+    fn multibyte_cmdlines_fit_budget() {
+        let mut entries: Vec<ChainEntry> = (0..16u32)
+            .map(|i| ChainEntry {
+                pid: 100 - i,
+                ppid: Some(99 - i),
+                comm: "worker".into(),
+                cmdline: if i % 2 == 0 {
+                    "\u{4e2d}\u{6587}".repeat(100)
+                } else {
+                    "\u{1F600}".repeat(200)
+                },
+            })
+            .collect();
+        assert!(serde_json::to_string(&entries).unwrap().len() > MAX_CHAIN_BYTES);
+        fit_budget(&mut entries);
+        assert!(serde_json::to_string(&entries).unwrap().len() <= MAX_CHAIN_BYTES);
+        assert_eq!(entries.len(), 16);
+        for e in &entries {
+            assert!(e.cmdline.ends_with('…'));
+            assert_eq!(e.comm, "worker");
+        }
+    }
+
+    #[test]
     fn short_cmdlines_are_untouched_by_budget() {
         let dir = TempDir::new();
         add(&dir, 1, "init", 0, b"init\0");
