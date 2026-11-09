@@ -15,10 +15,12 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
+    caller_command::{ChainEntry, CommandChain},
     config::AppConfig,
     dbus_server::SecretAccessor,
     error::{Error, Result},
     key_store::{self, SecureKey},
+    process_tree::ChainEnd,
 };
 
 pub const CHALLENGE_MAGIC: &[u8; 5] = b"ALHM1";
@@ -167,7 +169,9 @@ pub struct LocalChallenge {
     pub process_name: String,
     /// Absent when parked by an older daemon.
     #[serde(default)]
-    pub command_line: String,
+    pub command_chain: Vec<ChainEntry>,
+    #[serde(default)]
+    pub chain_end: Option<ChainEnd>,
     pub access_timestamp_ms: String,
     pub domain: String,
     pub port: String,
@@ -184,7 +188,8 @@ struct AndroidAuthPayload {
     username: String,
     pid: String,
     process_name: String,
-    command_line: String,
+    command_chain: Vec<ChainEntry>,
+    chain_end: Option<ChainEnd>,
     access_timestamp_ms: String,
     domain: String,
     port: String,
@@ -448,7 +453,8 @@ impl AuthGate {
                         username: payload.username,
                         pid: payload.pid,
                         process_name: payload.process_name,
-                        command_line: payload.command_line,
+                        command_chain: payload.command_chain.clone(),
+                        chain_end: payload.chain_end,
                         access_timestamp_ms: payload.access_timestamp_ms,
                         domain: payload.domain,
                         port: payload.port,
@@ -479,7 +485,8 @@ impl AuthGate {
                 "username": payload.username,
                 "pid": payload.pid,
                 "process_name": payload.process_name,
-                "command_line": payload.command_line,
+                "command_chain": payload.command_chain,
+                "chain_end": payload.chain_end,
                 "access_timestamp_ms": payload.access_timestamp_ms,
                 "domain": payload.domain,
                 "port": payload.port,
@@ -626,7 +633,12 @@ impl AuthGate {
             username: optional_string(accessor.username.as_ref()),
             pid: accessor.pid.to_string(),
             process_name: optional_string(accessor.process_name.as_ref()),
-            command_line: optional_string(accessor.cmdline.as_ref()),
+            command_chain: accessor
+                .chain
+                .as_ref()
+                .map(|c| c.entries.clone())
+                .unwrap_or_default(),
+            chain_end: accessor.chain.as_ref().map(|c| c.end),
             access_timestamp_ms: timestamp_ms.to_string(),
             domain,
             port,
@@ -903,7 +915,8 @@ mod tests {
                 username: field(),
                 pid: field(),
                 process_name: field(),
-                command_line: field(),
+                command_chain: Vec::new(),
+                chain_end: None,
                 access_timestamp_ms: field(),
                 domain: field(),
                 port: field(),
@@ -1090,7 +1103,7 @@ mod tests {
         assert_eq!(payload.uid, unsafe { libc::getuid() }.to_string());
         assert!(!payload.username.is_empty());
         assert!(!payload.process_name.is_empty());
-        assert!(!payload.command_line.is_empty());
+        assert!(!payload.command_chain.is_empty());
         let ts: i64 = payload.access_timestamp_ms.parse().unwrap();
         assert!(ts > 0);
         assert_eq!(payload.service_uuid, "svc-uuid-123");
@@ -1120,13 +1133,14 @@ mod tests {
         assert_eq!(payload.uid, "0");
         assert!(payload.username.is_empty());
         assert!(payload.process_name.is_empty());
-        assert!(payload.command_line.is_empty());
+        assert!(payload.command_chain.is_empty());
+        assert!(payload.chain_end.is_none());
         let ts: i64 = payload.access_timestamp_ms.parse().unwrap();
         assert!(ts > 0);
     }
 
     #[test]
-    fn test_local_challenge_without_command_line_still_parses() {
+    fn test_local_challenge_without_command_chain_still_parses() {
         let old = serde_json::json!({
             "request_uuid": "r", "device_uuid": "d", "device_name": "n",
             "encrypted_blob": "b", "ephemeral_public_key": "e", "uid": "1",
@@ -1135,13 +1149,30 @@ mod tests {
             "service_uuid": "s", "service_name": "h"
         });
         let challenge: LocalChallenge = serde_json::from_value(old).unwrap();
-        assert_eq!(challenge.command_line, "");
+        assert!(challenge.command_chain.is_empty());
+        assert!(challenge.chain_end.is_none());
     }
 
     #[test]
-    fn test_build_auth_payload_includes_synthetic_command_line() {
+    fn test_build_auth_payload_includes_command_chain() {
         let mut accessor = SecretAccessor::default();
-        accessor.cmdline = Some("tool --flag value".to_string()).into();
+        accessor.chain = Some(CommandChain {
+            entries: vec![
+                ChainEntry {
+                    pid: 50,
+                    ppid: Some(1),
+                    comm: "tool".into(),
+                    cmdline: "tool --flag value".into(),
+                },
+                ChainEntry {
+                    pid: 1,
+                    ppid: Some(0),
+                    comm: "systemd".into(),
+                    cmdline: String::new(),
+                },
+            ],
+            end: ChainEnd::Root,
+        });
         let identity = key_store::ServiceIdentity {
             service_uuid: "svc".to_string(),
             service_name: "Host".to_string(),
@@ -1155,9 +1186,14 @@ mod tests {
             "443".to_string(),
             &identity,
         );
-        assert_eq!(payload.command_line, "tool --flag value");
         let json = serde_json::to_value(&payload).unwrap();
-        assert_eq!(json["command_line"], "tool --flag value");
+        assert!(json.get("command_line").is_none());
+        assert_eq!(json["chain_end"], "root");
+        assert_eq!(json["command_chain"][0]["pid"], 50);
+        assert_eq!(json["command_chain"][0]["ppid"], 1);
+        assert_eq!(json["command_chain"][0]["comm"], "tool");
+        assert_eq!(json["command_chain"][0]["cmdline"], "tool --flag value");
+        assert_eq!(json["command_chain"][1]["cmdline"], "");
     }
 
     #[test]

@@ -76,7 +76,7 @@ fn neutralise(s: &str) -> String {
         .collect()
 }
 
-fn truncate_chars(s: String, max: usize) -> String {
+pub(crate) fn truncate_chars(s: String, max: usize) -> String {
     if s.chars().count() <= max {
         return s;
     }

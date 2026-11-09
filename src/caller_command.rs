@@ -1,31 +1,97 @@
-//! Policy deciding which command line is shown to the approver for a caller.
+//! Builds the process chain (caller and all its ancestors) shown to the
+//! approver, within the size budget of the push notification.
 
-use crate::{process_cmdline::read_command_line, process_tree::ProcTree};
+use serde::{Deserialize, Serialize};
 
-/// Caller name of the sudo approval client spawned by `sudo-alohomora-auth`
-/// (see `sudo_auth`). Its own command line says nothing useful.
-const SUDO_AUTH_COMM: &str = "sudo-auth";
-const SUDO_COMM: &str = "sudo";
+use crate::{
+    process_cmdline::{read_command_line, truncate_chars},
+    process_tree::{ChainEnd, ProcTree},
+};
 
-/// Command line to display for the caller `pid` whose `comm` is `process_name`.
-///
-/// For the sudo PAM helper the intermediate wrapper/PAM processes are skipped
-/// and the nearest `sudo` ancestor's command line is used instead, so the
-/// approver sees what is actually being run with elevated privileges.
-/// Returns an empty string when nothing can be determined.
-pub fn command_line_for_caller(tree: &ProcTree, pid: u32, process_name: Option<&str>) -> String {
-    let target = if process_name == Some(SUDO_AUTH_COMM) {
-        tree.find_ancestor(pid, |e| e.comm == SUDO_COMM)
-            .map_or(pid, |e| e.pid)
-    } else {
-        pid
-    };
-    read_command_line(tree.root(), target)
+/// Maximum number of chain entries (caller included).
+pub const MAX_CHAIN_ENTRIES: usize = 16;
+/// Maximum characters of each entry's command line.
+pub const MAX_ENTRY_CMDLINE_CHARS: usize = 200;
+/// Maximum serialized size of the entry list in bytes (FCM allows 4096 total).
+pub const MAX_CHAIN_BYTES: usize = 2500;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainEntry {
+    pub pid: u32,
+    pub ppid: Option<u32>,
+    pub comm: String,
+    pub cmdline: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandChain {
+    pub entries: Vec<ChainEntry>,
+    pub end: ChainEnd,
+}
+
+/// Chain for the caller `pid`: caller first, then each ancestor up to pid 1.
+/// `process_name` is used as the caller's `comm` if its `/proc` entry is gone.
+pub fn command_chain_for_caller(
+    tree: &ProcTree,
+    pid: u32,
+    process_name: Option<&str>,
+) -> CommandChain {
+    let (walked, end) = tree.walk(pid, MAX_CHAIN_ENTRIES);
+    let mut entries: Vec<ChainEntry> = walked
+        .into_iter()
+        .map(|e| ChainEntry {
+            pid: e.pid,
+            ppid: Some(e.ppid),
+            cmdline: truncate_chars(
+                read_command_line(tree.root(), e.pid),
+                MAX_ENTRY_CMDLINE_CHARS,
+            ),
+            comm: e.comm,
+        })
+        .collect();
+    if entries.is_empty() {
+        entries.push(ChainEntry {
+            pid,
+            ppid: None,
+            comm: process_name.unwrap_or_default().to_string(),
+            cmdline: String::new(),
+        });
+    }
+    fit_budget(&mut entries);
+    CommandChain { entries, end }
+}
+
+fn serialized_len(entries: &[ChainEntry]) -> usize {
+    serde_json::to_string(entries).map_or(usize::MAX, |s| s.len())
+}
+
+/// Shorten the longest command lines until the chain fits [`MAX_CHAIN_BYTES`].
+/// Entries, pids and comms are never dropped.
+fn fit_budget(entries: &mut [ChainEntry]) {
+    loop {
+        let size = serialized_len(entries);
+        if size <= MAX_CHAIN_BYTES {
+            return;
+        }
+        let Some(longest) = entries
+            .iter_mut()
+            .filter(|e| e.cmdline.chars().count() > 1)
+            .max_by_key(|e| e.cmdline.chars().count())
+        else {
+            return;
+        };
+        let len = longest.cmdline.chars().count();
+        let step = ((size - MAX_CHAIN_BYTES) / 4).max(1);
+        let target = len.saturating_sub(step).max(1);
+        let mut shortened: String = longest.cmdline.chars().take(target - 1).collect();
+        shortened.push('…');
+        longest.cmdline = shortened;
+    }
 }
 
 /// Convenience wrapper over the real `/proc`.
-pub fn system_command_line_for_caller(pid: u32, process_name: Option<&str>) -> String {
-    command_line_for_caller(&ProcTree::system(), pid, process_name)
+pub fn system_command_chain_for_caller(pid: u32, process_name: Option<&str>) -> CommandChain {
+    command_chain_for_caller(&ProcTree::system(), pid, process_name)
 }
 
 #[cfg(test)]
@@ -41,23 +107,143 @@ mod tests {
         fs::write(p.join("cmdline"), cmdline).unwrap();
     }
 
-    fn sudo_tree() -> (TempDir, ProcTree) {
+    fn pids(c: &CommandChain) -> Vec<u32> {
+        c.entries.iter().map(|e| e.pid).collect()
+    }
+
+    #[test]
+    fn normal_chain_to_pid_1() {
         let dir = TempDir::new();
+        add(&dir, 1, "systemd", 0, b"/sbin/init\0");
         add(&dir, 10, "bash", 1, b"-bash\0");
+        add(&dir, 60, "ssh", 10, b"ssh\0-p\x002222\0host.invalid\0");
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 60, Some("ssh"));
+        assert_eq!(pids(&c), [60, 10, 1]);
+        assert_eq!(c.end, ChainEnd::Root);
+        assert_eq!(c.entries[0].cmdline, "ssh -p 2222 host.invalid");
+        assert_eq!(c.entries[0].comm, "ssh");
+        assert_eq!(c.entries[0].ppid, Some(10));
+        assert_eq!(c.entries[2].ppid, Some(0));
+    }
+
+    #[test]
+    fn parent_exited() {
+        let dir = TempDir::new();
+        add(&dir, 60, "ssh", 10, b"ssh\0host.invalid\0");
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 60, None);
+        assert_eq!(pids(&c), [60]);
+        assert_eq!(c.end, ChainEnd::ParentExited);
+    }
+
+    #[test]
+    fn cycle() {
+        let dir = TempDir::new();
+        add(&dir, 2, "a", 3, b"a\0");
+        add(&dir, 3, "b", 4, b"b\0");
+        add(&dir, 4, "c", 2, b"c\0");
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 2, None);
+        assert_eq!(pids(&c), [2, 3, 4]);
+        assert_eq!(c.end, ChainEnd::Cycle);
+    }
+
+    #[test]
+    fn more_than_16_entries_is_depth_limited() {
+        let dir = TempDir::new();
+        for p in 2..=30u32 {
+            add(&dir, p, "p", p + 1, b"p\0");
+        }
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 2, None);
+        assert_eq!(c.entries.len(), MAX_CHAIN_ENTRIES);
+        assert_eq!(c.end, ChainEnd::DepthLimit);
+    }
+
+    #[test]
+    fn exactly_16_entries_ending_at_root_is_root() {
+        let dir = TempDir::new();
+        for p in 1..=16u32 {
+            add(&dir, p, "p", p - 1, b"p\0");
+        }
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 16, None);
+        assert_eq!(c.entries.len(), 16);
+        assert_eq!(c.end, ChainEnd::Root);
+    }
+
+    #[test]
+    fn size_budget_shortens_longest_cmdlines_only() {
+        let dir = TempDir::new();
+        let long = format!("{}\0", "x".repeat(900));
+        for p in 1..=16u32 {
+            add(&dir, p, "worker", p - 1, long.as_bytes());
+        }
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 16, None);
+        assert_eq!(c.entries.len(), 16);
+        assert!(serde_json::to_string(&c.entries).unwrap().len() <= MAX_CHAIN_BYTES);
+        for e in &c.entries {
+            assert!(e.cmdline.chars().count() <= MAX_ENTRY_CMDLINE_CHARS);
+            assert!(e.cmdline.ends_with('…'));
+            assert_eq!(e.comm, "worker");
+        }
+        assert_eq!(pids(&c), (1..=16).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn short_cmdlines_are_untouched_by_budget() {
+        let dir = TempDir::new();
+        add(&dir, 1, "init", 0, b"init\0");
+        add(&dir, 5, "tool", 1, b"tool\0--flag\0");
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 5, None);
+        assert_eq!(c.entries[0].cmdline, "tool --flag");
+    }
+
+    #[test]
+    fn injection_in_argv_is_neutralised() {
+        let dir = TempDir::new();
+        add(&dir, 1, "init", 0, b"init\0");
         add(
             &dir,
-            20,
-            "sudo",
-            10,
-            b"sudo\0systemctl\0restart\0example.service\0",
+            5,
+            "evil",
+            1,
+            "evil\n\u{202E}approved\0\u{2066}x\0".as_bytes(),
         );
-        add(
-            &dir,
-            30,
-            "sudo",
-            20,
-            b"sudo\0systemctl\0restart\0example.service\0",
-        );
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 5, None);
+        let line = &c.entries[0].cmdline;
+        assert!(!line.contains('\n'));
+        assert!(!line.contains('\u{202E}') && !line.contains('\u{2066}'));
+        assert!(line.contains('\u{FFFD}'));
+        let json = serde_json::to_string(&c.entries).unwrap();
+        assert!(!json.contains("\\n"));
+    }
+
+    #[test]
+    fn caller_exited() {
+        let dir = TempDir::new();
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 9999, Some("sudo-auth"));
+        assert_eq!(c.entries.len(), 1);
+        assert_eq!(c.entries[0].pid, 9999);
+        assert_eq!(c.entries[0].ppid, None);
+        assert_eq!(c.entries[0].comm, "sudo-auth");
+        assert_eq!(c.entries[0].cmdline, "");
+        assert_eq!(c.end, ChainEnd::ParentExited);
+    }
+
+    #[test]
+    fn sudo_chain_shows_all_layers() {
+        let dir = TempDir::new();
+        add(&dir, 1, "systemd", 0, b"/sbin/init\0");
+        add(&dir, 10, "bash", 1, b"-bash\0");
+        let sudo = b"sudo\0systemctl\0restart\0example.service\0";
+        add(&dir, 20, "sudo", 10, sudo);
+        add(&dir, 30, "sudo", 20, sudo);
         add(
             &dir,
             40,
@@ -72,45 +258,13 @@ mod tests {
             40,
             b"sudo-auth\0lookup\0service\0sudo\0",
         );
-        add(&dir, 60, "ssh", 10, b"ssh\0-p\x002222\0host.invalid\0");
         let tree = ProcTree::with_root(dir.path());
-        (dir, tree)
-    }
-
-    #[test]
-    fn ordinary_caller_uses_own_command_line() {
-        let (_d, tree) = sudo_tree();
+        let c = command_chain_for_caller(&tree, 50, Some("sudo-auth"));
+        assert_eq!(pids(&c), [50, 40, 30, 20, 10, 1]);
         assert_eq!(
-            command_line_for_caller(&tree, 60, Some("ssh")),
-            "ssh -p 2222 host.invalid"
-        );
-    }
-
-    #[test]
-    fn sudo_auth_uses_nearest_sudo_ancestor() {
-        let (_d, tree) = sudo_tree();
-        assert_eq!(
-            command_line_for_caller(&tree, 50, Some("sudo-auth")),
+            c.entries[3].cmdline,
             "sudo systemctl restart example.service"
         );
-    }
-
-    #[test]
-    fn sudo_auth_without_sudo_ancestor_falls_back_to_own() {
-        let dir = TempDir::new();
-        add(&dir, 5, "bash", 0, b"bash\0");
-        add(&dir, 6, "sudo-auth", 5, b"sudo-auth\0lookup\0");
-        let tree = ProcTree::with_root(dir.path());
-        assert_eq!(
-            command_line_for_caller(&tree, 6, Some("sudo-auth")),
-            "sudo-auth lookup"
-        );
-    }
-
-    #[test]
-    fn unknown_or_exited_pid_is_empty() {
-        let (_d, tree) = sudo_tree();
-        assert_eq!(command_line_for_caller(&tree, 9999, None), "");
-        assert_eq!(command_line_for_caller(&tree, 9999, Some("sudo-auth")), "");
+        assert_eq!(c.end, ChainEnd::Root);
     }
 }
