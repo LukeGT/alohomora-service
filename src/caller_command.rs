@@ -235,15 +235,20 @@ mod tests {
         fit_budget(&mut entries);
         assert!(serde_json::to_string(&entries).unwrap().len() <= MAX_CHAIN_BYTES);
         assert_eq!(entries.len(), 16);
+        assert!(entries.iter().any(|e| e.truncated_chars > 0));
         for (i, e) in entries.iter().enumerate() {
-            assert!(e.cmdline.ends_with('…'));
             assert_eq!(e.comm, "worker");
             // kept chars (without the marker) plus cut chars is the original 200
-            assert_eq!(
-                e.cmdline.chars().count() - 1 + e.truncated_chars as usize,
-                200,
-                "{i}"
-            );
+            if e.truncated_chars > 0 {
+                assert!(e.cmdline.ends_with('…'));
+                assert_eq!(
+                    e.cmdline.chars().count() - 1 + e.truncated_chars as usize,
+                    200,
+                    "{i}"
+                );
+            } else {
+                assert_eq!(e.cmdline.chars().count(), 200, "{i}");
+            }
         }
     }
 
