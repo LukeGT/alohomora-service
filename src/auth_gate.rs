@@ -15,7 +15,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    caller_command::{ChainEntry, CommandChain},
+    caller_command::ChainEntry,
     config::AppConfig,
     dbus_server::SecretAccessor,
     error::{Error, Result},
@@ -1156,7 +1156,7 @@ mod tests {
     #[test]
     fn test_build_auth_payload_includes_command_chain() {
         let mut accessor = SecretAccessor::default();
-        accessor.chain = Some(CommandChain {
+        accessor.chain = Some(crate::caller_command::CommandChain {
             entries: vec![
                 ChainEntry {
                     pid: 50,
