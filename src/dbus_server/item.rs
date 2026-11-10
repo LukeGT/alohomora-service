@@ -350,6 +350,28 @@ pub(crate) async fn secret_key_for(
     }
 }
 
+/// Phone approval for a delete. Unlike reads, unlock grants never satisfy it.
+/// Cancelled if the caller leaves the bus.
+pub(crate) async fn delete_approval_for(
+    auth_gate: &AuthGate,
+    grants: &UnlockGrants,
+    header: &Header<'_>,
+    label: &str,
+    access_info: Option<&SecretAccessor<'_>>,
+) -> Result<()> {
+    let Some(sender) = header.sender() else {
+        return auth_gate.request_delete_approval(label, access_info).await;
+    };
+    let gone = grants.disconnected(sender.as_str());
+    tokio::select! {
+        result = auth_gate.request_delete_approval(label, access_info) => result,
+        () = gone => {
+            info!("{sender} left the bus; cancelled its delete approval request");
+            Err(Error::PermissionDenied)
+        }
+    }
+}
+
 async fn send_access_notification(
     connection: &Connection,
     label: &str,
@@ -413,9 +435,25 @@ impl Item<'static> {
     async fn delete(
         &'_ self,
         #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
         #[zbus(object_server)] object_server: &ObjectServer,
     ) -> Result<ObjectPath<'_>> {
-        // delete from the stoer
+        let label = self
+            .store
+            .get_secret_label(self.collection_id.clone(), self.id.clone())
+            .await
+            .unwrap_or_else(|_| self.id.to_string());
+        let access_info = access_info_from_header(&header, connection).await?;
+        delete_approval_for(
+            &self.auth_gate,
+            &self.grants,
+            &header,
+            &label,
+            access_info.as_ref(),
+        )
+        .await?;
+
+        // delete from the store
         self.store
             .delete_secret(self.collection_id.clone(), self.id.clone())
             .await?;

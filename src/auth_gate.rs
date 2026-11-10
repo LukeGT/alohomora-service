@@ -154,6 +154,21 @@ struct AuthGateInner {
     local_challenges: Mutex<HashMap<String, Vec<LocalChallenge>>>,
 }
 
+/// What the phone is being asked to approve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthAction {
+    #[default]
+    Access,
+    Delete,
+}
+
+impl AuthAction {
+    pub fn is_access(&self) -> bool {
+        *self == AuthAction::Access
+    }
+}
+
 /// A pending challenge for a local device, as served by
 /// `GET /alohomora/local/challenges`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +192,11 @@ pub struct LocalChallenge {
     pub port: String,
     pub service_uuid: String,
     pub service_name: String,
+    /// Omitted for plain access requests.
+    #[serde(default, skip_serializing_if = "AuthAction::is_access")]
+    pub action: AuthAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_label: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -195,6 +215,10 @@ struct AndroidAuthPayload {
     port: String,
     service_uuid: String,
     service_name: String,
+    #[serde(default, skip_serializing_if = "AuthAction::is_access")]
+    action: AuthAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_label: Option<String>,
 }
 
 impl AuthGate {
@@ -248,6 +272,28 @@ impl AuthGate {
     pub async fn request_secret_key(
         &self,
         accessor: Option<&SecretAccessor<'_>>,
+    ) -> Result<SecureKey> {
+        self.request_approval(accessor, AuthAction::Access, None)
+            .await
+    }
+
+    /// Phone approval for deleting an item or collection. Unlock grants do not
+    /// apply; the returned key is discarded.
+    pub async fn request_delete_approval(
+        &self,
+        label: &str,
+        accessor: Option<&SecretAccessor<'_>>,
+    ) -> Result<()> {
+        self.request_approval(accessor, AuthAction::Delete, Some(label.to_string()))
+            .await
+            .map(drop)
+    }
+
+    async fn request_approval(
+        &self,
+        accessor: Option<&SecretAccessor<'_>>,
+        action: AuthAction,
+        target_label: Option<String>,
     ) -> Result<SecureKey> {
         let default_accessor;
         let accessor = match accessor {
@@ -425,6 +471,9 @@ impl AuthGate {
                 port.clone(),
                 &service_identity,
             );
+            let mut payload = payload;
+            payload.action = action;
+            payload.target_label = target_label.clone();
 
             if device.kind == key_store::DeviceKind::Local {
                 // Local devices get no push notification: park the challenge
@@ -460,6 +509,8 @@ impl AuthGate {
                         port: payload.port,
                         service_uuid: payload.service_uuid,
                         service_name: payload.service_name,
+                        action: payload.action,
+                        target_label: payload.target_label.clone(),
                     });
                 delivered += 1;
                 continue;
@@ -476,7 +527,7 @@ impl AuthGate {
                 }
             };
 
-            let request_body = serde_json::json!({
+            let mut request_body = serde_json::json!({
                 "token": fcm_token,
                 "request_uuid": payload.request_uuid,
                 "encrypted_blob": payload.encrypted_blob,
@@ -493,6 +544,13 @@ impl AuthGate {
                 "service_uuid": payload.service_uuid,
                 "service_name": payload.service_name,
             });
+
+            if payload.action != AuthAction::Access {
+                request_body["action"] = serde_json::json!(payload.action);
+            }
+            if let Some(label) = &payload.target_label {
+                request_body["target_label"] = serde_json::json!(label);
+            }
 
             let client = reqwest::Client::new();
             let url = &self.inner.notification_url;
@@ -644,6 +702,8 @@ impl AuthGate {
             port,
             service_uuid: service_identity.service_uuid.clone(),
             service_name: service_identity.service_name.clone(),
+            action: AuthAction::Access,
+            target_label: None,
         }
     }
 }
@@ -922,6 +982,8 @@ mod tests {
                 port: field(),
                 service_uuid: field(),
                 service_name: field(),
+                action: AuthAction::Access,
+                target_label: None,
             }],
         );
     }
@@ -1224,5 +1286,49 @@ mod tests {
 
         let ts: i64 = payload.access_timestamp_ms.parse().unwrap();
         assert!(ts >= before && ts <= after);
+    }
+}
+
+#[cfg(test)]
+mod action_payload_tests {
+    use super::*;
+
+    fn challenge(action: AuthAction, target_label: Option<String>) -> serde_json::Value {
+        let field = String::new;
+        serde_json::to_value(LocalChallenge {
+            request_uuid: field(),
+            device_uuid: field(),
+            device_name: field(),
+            encrypted_blob: field(),
+            ephemeral_public_key: field(),
+            uid: field(),
+            username: field(),
+            pid: field(),
+            process_name: field(),
+            command_chain: Vec::new(),
+            chain_end: None,
+            access_timestamp_ms: field(),
+            domain: field(),
+            port: field(),
+            service_uuid: field(),
+            service_name: field(),
+            action,
+            target_label,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn access_payload_omits_action_fields() {
+        let v = challenge(AuthAction::Access, None);
+        assert!(v.get("action").is_none());
+        assert!(v.get("target_label").is_none());
+    }
+
+    #[test]
+    fn delete_payload_carries_action_and_label() {
+        let v = challenge(AuthAction::Delete, Some("my secret".into()));
+        assert_eq!(v["action"], "delete");
+        assert_eq!(v["target_label"], "my secret");
     }
 }

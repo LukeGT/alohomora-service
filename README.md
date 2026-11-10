@@ -74,6 +74,7 @@ What this means for clients:
 - `secret-tool search` without `--unlock` lists only the attributes of locked items and no longer prints secrets.
 - Clients that check `Locked` themselves must call `Unlock` first. Python `secretstorage`, for example, raises `LockedException` from `Item.get_secret()` and `Collection.create_item()` unless the item or collection was unlocked (as the `keyring` package does) just before.
 - Clients that skip `Unlock` and call `GetSecrets`/`GetSecret`/`CreateItem`/`SetSecret` directly still work: the call blocks until the phone approval arrives, so it is limited by the client's method-call timeout (25 seconds for libsecret). The pending request is cancelled if the client disconnects.
+- Deleting an item or collection (`Item.Delete`, `Collection.Delete`) always needs its own phone approval, which an unlock grant never satisfies; a denied or timed-out approval fails with `AccessDenied` and nothing is removed. `secret-tool clear` does not work, because it deletes items found via `SearchItems`, which returns them locked and does not ask the phone.
 
 ### Access notifications (`--notify-on-access`)
 

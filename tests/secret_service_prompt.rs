@@ -815,3 +815,110 @@ async fn secret_tool_lookup_survives_slow_approval() {
     assert_eq!(stdout, "password-g");
     assert!(elapsed >= Duration::from_secs(30));
 }
+
+const ITEM_IFACE: &str = "org.freedesktop.Secret.Item";
+const COLLECTION_IFACE: &str = "org.freedesktop.Secret.Collection";
+
+fn parent_path(item: &str) -> &str {
+    item.rsplit_once('/').expect("item path has a parent").0
+}
+
+fn assert_access_denied<T: std::fmt::Debug>(result: zbus::Result<T>) {
+    match result {
+        Err(zbus::Error::MethodError(name, _, _)) => {
+            assert_eq!(name.as_str(), "org.freedesktop.DBus.Error.AccessDenied")
+        }
+        other => panic!("expected AccessDenied, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn item_delete_needs_phone_approval() {
+    let Some(h) = Harness::start(60, Some(Duration::from_millis(200))).await else {
+        return;
+    };
+    let item = h.store("delete-a", "password-a").await;
+    let client = h.client().await;
+    // an unlock grant must not stand in for delete approval
+    let (_, prompt) = unlock(&client, &[item.as_str()]).await;
+    let mut completed = completed_stream(&client, &prompt).await;
+    start_prompt(&client, &prompt).await;
+    next_completed(&mut completed, Duration::from_secs(60)).await;
+
+    let before = h.approver.challenges();
+    let _: OwnedObjectPath = call(&client, item.as_str(), ITEM_IFACE, "Delete", &())
+        .await
+        .unwrap();
+    assert_eq!(
+        h.approver.challenges() - before,
+        1,
+        "delete asked the phone"
+    );
+    let (unlocked, locked) = search(&client, "delete-a").await;
+    assert!(unlocked.is_empty() && locked.is_empty(), "item is gone");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn item_delete_times_out_without_approval() {
+    let Some(h) = Harness::start(3, Some(Duration::from_millis(200))).await else {
+        return;
+    };
+    let item = h.store("delete-b", "password-b").await;
+    h.approver.set_delay(None);
+    let client = h.client().await;
+
+    let delete = {
+        let (client, item) = (client.clone(), item.clone());
+        tokio::spawn(async move {
+            call::<_, OwnedObjectPath>(&client, item.as_str(), ITEM_IFACE, "Delete", &()).await
+        })
+    };
+    h.wait_for_pending_request().await;
+    let challenge = h.gate.pending_local_challenges().await.remove(0);
+    assert_eq!(
+        challenge.action,
+        pass_secret_service::auth_gate::AuthAction::Delete
+    );
+    assert_eq!(challenge.target_label.as_deref(), Some("delete-b"));
+
+    assert_access_denied(delete.await.unwrap());
+    let (unlocked, locked) = search(&client, "delete-b").await;
+    assert_eq!(unlocked.len() + locked.len(), 1, "item remains");
+    h.assert_idle(&client).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn collection_delete_needs_phone_approval() {
+    let Some(h) = Harness::start(3, Some(Duration::from_millis(200))).await else {
+        return;
+    };
+    let item = h.store("delete-c", "password-c").await;
+    let collection = parent_path(item.as_str()).to_string();
+    let client = h.client().await;
+
+    // denied first: nothing is removed
+    h.approver.set_delay(None);
+    let denied = {
+        let (client, collection) = (client.clone(), collection.clone());
+        tokio::spawn(async move {
+            call::<_, OwnedObjectPath>(&client, &collection, COLLECTION_IFACE, "Delete", &()).await
+        })
+    };
+    assert_access_denied(denied.await.unwrap());
+    let (unlocked, locked) = search(&client, "delete-c").await;
+    assert_eq!(unlocked.len() + locked.len(), 1, "item remains");
+    h.assert_idle(&client).await;
+
+    // approved: exactly one approval for the whole collection
+    h.approver.set_delay(Some(Duration::from_millis(200)));
+    let before = h.approver.challenges();
+    let _: OwnedObjectPath = call(&client, &collection, COLLECTION_IFACE, "Delete", &())
+        .await
+        .unwrap();
+    assert_eq!(h.approver.challenges() - before, 1);
+    let (unlocked, locked) = search(&client, "delete-c").await;
+    assert!(
+        unlocked.is_empty() && locked.is_empty(),
+        "collection is gone"
+    );
+}
