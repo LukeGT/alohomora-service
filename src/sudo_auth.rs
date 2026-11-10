@@ -90,11 +90,11 @@ pub fn spawn(auth_gate: AuthGate, socket_path: &Path) -> Result<JoinHandle<()>> 
 }
 
 async fn accessor_for(uid: u32, pid: u32) -> SecretAccessor<'static> {
-    let cmdline = spawn_blocking(move || {
-        caller_command::system_command_line_for_caller(pid, Some(CALLER_NAME))
+    let chain = spawn_blocking(move || {
+        caller_command::system_command_chain_for_caller(pid, Some(CALLER_NAME))
     })
     .await
-    .unwrap_or_default();
+    .ok();
     SecretAccessor {
         dbus_name: Optional::from(None),
         uid,
@@ -102,7 +102,7 @@ async fn accessor_for(uid: u32, pid: u32) -> SecretAccessor<'static> {
         pid,
         process_name: Optional::from(Some(CALLER_NAME.to_string())),
         timestamp: Timestamp::now().as_millisecond(),
-        cmdline: Optional::from(Some(cmdline)),
+        chain,
     }
 }
 

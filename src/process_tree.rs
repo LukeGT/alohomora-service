@@ -21,6 +21,20 @@ pub struct ProcessEntry {
     pub comm: String,
 }
 
+/// Why a process-chain walk stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainEnd {
+    /// Reached pid 1 (or a process whose parent is 0).
+    Root,
+    /// The parent could not be read (it exited, or is not visible).
+    ParentExited,
+    /// A parent link pointed back at an already visited process.
+    Cycle,
+    /// The walk was cut off at the caller's entry limit.
+    DepthLimit,
+}
+
 /// A view of a procfs mount. `ProcTree::system()` reads the real `/proc`;
 /// tests can point it at a synthetic directory.
 #[derive(Debug, Clone)]
@@ -61,6 +75,35 @@ impl ProcTree {
             next: self.parent_pid(pid),
             seen: HashSet::from([pid]),
             remaining: MAX_ANCESTOR_DEPTH,
+        }
+    }
+
+    /// Walk from `pid` up through its ancestors, returning the readable
+    /// processes (starting process first) and why the walk stopped. At most
+    /// `max_entries` entries are returned. If `pid` itself is unreadable the
+    /// result is empty with [`ChainEnd::ParentExited`].
+    pub fn walk(&self, pid: u32, max_entries: usize) -> (Vec<ProcessEntry>, ChainEnd) {
+        let mut chain: Vec<ProcessEntry> = Vec::new();
+        let mut seen = HashSet::new();
+        let mut next = pid;
+        loop {
+            let Some(entry) = self.entry(next) else {
+                return (chain, ChainEnd::ParentExited);
+            };
+            seen.insert(entry.pid);
+            let ppid = entry.ppid;
+            let is_root = entry.pid == 1 || ppid == 0;
+            chain.push(entry);
+            if is_root {
+                return (chain, ChainEnd::Root);
+            }
+            if seen.contains(&ppid) {
+                return (chain, ChainEnd::Cycle);
+            }
+            if chain.len() >= max_entries {
+                return (chain, ChainEnd::DepthLimit);
+            }
+            next = ppid;
         }
     }
 
@@ -197,6 +240,39 @@ mod tests {
         let entries: Vec<(u32, &str, u32)> = (1..=n).map(|p| (p, "p", p + 1)).collect();
         let (_d, tree) = fake_proc(&entries);
         assert_eq!(tree.ancestors(1).count(), MAX_ANCESTOR_DEPTH);
+    }
+
+    #[test]
+    fn walk_reaches_root() {
+        let (_d, tree) = fake_proc(&[(30, "leaf", 20), (20, "mid", 1), (1, "init", 0)]);
+        let (chain, end) = tree.walk(30, 16);
+        assert_eq!(chain.iter().map(|e| e.pid).collect::<Vec<_>>(), [30, 20, 1]);
+        assert_eq!(end, ChainEnd::Root);
+    }
+
+    #[test]
+    fn walk_parent_exited_and_missing_start() {
+        let (_d, tree) = fake_proc(&[(30, "leaf", 20)]);
+        let (chain, end) = tree.walk(30, 16);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(end, ChainEnd::ParentExited);
+        let (chain, end) = tree.walk(999, 16);
+        assert!(chain.is_empty());
+        assert_eq!(end, ChainEnd::ParentExited);
+    }
+
+    #[test]
+    fn walk_detects_cycle_and_depth_limit() {
+        let (_d, tree) = fake_proc(&[(1, "a", 2), (2, "b", 3), (3, "c", 2)]);
+        // pid 1 is treated as root, so start from 2 for the cycle
+        let (chain, end) = tree.walk(2, 16);
+        assert_eq!(chain.len(), 2);
+        assert_eq!(end, ChainEnd::Cycle);
+        let entries: Vec<(u32, &str, u32)> = (2..=40).map(|p| (p, "p", p + 1)).collect();
+        let (_d, tree) = fake_proc(&entries);
+        let (chain, end) = tree.walk(2, 16);
+        assert_eq!(chain.len(), 16);
+        assert_eq!(end, ChainEnd::DepthLimit);
     }
 
     #[test]

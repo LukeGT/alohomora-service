@@ -376,7 +376,7 @@ pub async fn process_authenticate_request(
         .await?;
     if let Some(challenge) = local_challenge {
         info!(
-            "Local device unlock approved: device {} ({}), request {}, requested by uid={} user={} pid={} process={} command={:?}",
+            "Local device unlock approved: device {} ({}), request {}, requested by uid={} user={} pid={} process={} chain_end={:?}",
             challenge.device_uuid,
             challenge.device_name,
             challenge.request_uuid,
@@ -384,7 +384,7 @@ pub async fn process_authenticate_request(
             challenge.username,
             challenge.pid,
             challenge.process_name,
-            challenge.command_line,
+            challenge.chain_end,
         );
     }
     Ok(StatusCode::NO_CONTENT)

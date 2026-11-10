@@ -1,31 +1,148 @@
-//! Policy deciding which command line is shown to the approver for a caller.
+//! Builds the process chain (caller and all its ancestors) shown to the
+//! approver, within the size budget of the push notification.
 
-use crate::{process_cmdline::read_command_line, process_tree::ProcTree};
+use serde::{Deserialize, Serialize};
 
-/// Caller name of the sudo approval client spawned by `sudo-alohomora-auth`
-/// (see `sudo_auth`). Its own command line says nothing useful.
-const SUDO_AUTH_COMM: &str = "sudo-auth";
-const SUDO_COMM: &str = "sudo";
+use crate::{
+    process_cmdline::{neutralise, read_command_line_uncapped},
+    process_tree::{ChainEnd, ProcTree},
+};
 
-/// Command line to display for the caller `pid` whose `comm` is `process_name`.
-///
-/// For the sudo PAM helper the intermediate wrapper/PAM processes are skipped
-/// and the nearest `sudo` ancestor's command line is used instead, so the
-/// approver sees what is actually being run with elevated privileges.
-/// Returns an empty string when nothing can be determined.
-pub fn command_line_for_caller(tree: &ProcTree, pid: u32, process_name: Option<&str>) -> String {
-    let target = if process_name == Some(SUDO_AUTH_COMM) {
-        tree.find_ancestor(pid, |e| e.comm == SUDO_COMM)
-            .map_or(pid, |e| e.pid)
-    } else {
-        pid
+// Limits mirrored by the relay (alohomora-web-service `index.js`, constants of the
+// same names). The relay rejects anything over them instead of trimming, so
+// keep both sides in sync; the `worst_case_*` test below guarantees that what
+// this service produces always passes the relay.
+
+/// Maximum number of chain entries (caller included).
+pub const MAX_CHAIN_ENTRIES: usize = 16;
+/// Maximum code points of each entry's command line.
+pub const MAX_ENTRY_CMDLINE_CHARS: usize = 200;
+/// Maximum code points of each entry's `comm`.
+pub const MAX_COMM_CHARS: usize = 32;
+/// Maximum serialized size of the entry list in bytes.
+pub const MAX_CHAIN_BYTES: usize = 2500;
+/// Maximum serialized size of the whole FCM data payload in bytes.
+pub const MAX_FCM_DATA_BYTES: usize = 4096;
+/// Service-side only: maximum size of the chain once embedded as an escaped JSON
+/// string value in the FCM data (quotes and backslashes double in size), leaving
+/// room for the other fields so the data payload stays within [`MAX_FCM_DATA_BYTES`].
+pub const MAX_CHAIN_EMBEDDED_BYTES: usize = 2600;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainEntry {
+    pub pid: u32,
+    pub ppid: Option<u32>,
+    pub comm: String,
+    pub cmdline: String,
+    /// Characters (code points) cut from the sanitised cmdline, by the per-entry
+    /// cap and by size-budget shortening; 0 if nothing was cut. The kept text
+    /// then ends in a single `…` marker that is not counted as kept. If the
+    /// `/proc` read itself stopped at 4096 bytes, counting starts from what was read.
+    #[serde(default)]
+    pub truncated_chars: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandChain {
+    pub entries: Vec<ChainEntry>,
+    pub end: ChainEnd,
+}
+
+/// Chain for the caller `pid`: caller first, then each ancestor up to pid 1.
+/// `process_name` is used as the caller's `comm` if its `/proc` entry is gone.
+pub fn command_chain_for_caller(
+    tree: &ProcTree,
+    pid: u32,
+    process_name: Option<&str>,
+) -> CommandChain {
+    let (walked, end) = tree.walk(pid, MAX_CHAIN_ENTRIES);
+    let mut entries: Vec<ChainEntry> = walked
+        .into_iter()
+        .map(|e| {
+            let (cmdline, truncated_chars) =
+                cap_cmdline(read_command_line_uncapped(tree.root(), e.pid));
+            ChainEntry {
+                pid: e.pid,
+                ppid: Some(e.ppid),
+                cmdline,
+                comm: clean_comm(&e.comm),
+                truncated_chars,
+            }
+        })
+        .collect();
+    if entries.is_empty() {
+        entries.push(ChainEntry {
+            pid,
+            ppid: None,
+            comm: clean_comm(process_name.unwrap_or_default()),
+            cmdline: String::new(),
+            truncated_chars: 0,
+        });
+    }
+    fit_budget(&mut entries);
+    CommandChain { entries, end }
+}
+
+/// Neutralise control/bidi characters (kernel comm is attacker-settable) and cap length.
+fn clean_comm(comm: &str) -> String {
+    neutralise(comm).chars().take(MAX_COMM_CHARS).collect()
+}
+
+/// Apply the per-entry cap, returning the kept text and the chars cut.
+fn cap_cmdline(full: String) -> (String, u32) {
+    let total = full.chars().count();
+    if total <= MAX_ENTRY_CMDLINE_CHARS {
+        return (full, 0);
+    }
+    let kept = MAX_ENTRY_CMDLINE_CHARS - 1;
+    let mut text: String = full.chars().take(kept).collect();
+    text.push('…');
+    (text, (total - kept) as u32)
+}
+
+/// Bytes by which the chain exceeds the budget (0 when it fits): both the plain
+/// serialized size and the size embedded as a string value in the FCM data count.
+fn excess_bytes(entries: &[ChainEntry]) -> usize {
+    let Ok(plain) = serde_json::to_string(entries) else {
+        return usize::MAX;
     };
-    read_command_line(tree.root(), target)
+    let embedded = serde_json::to_string(&plain).map_or(usize::MAX, |s| s.len());
+    plain
+        .len()
+        .saturating_sub(MAX_CHAIN_BYTES)
+        .max(embedded.saturating_sub(MAX_CHAIN_EMBEDDED_BYTES))
+}
+
+/// Shorten the longest command lines until the chain fits [`MAX_CHAIN_BYTES`].
+/// Entries, pids and comms are never dropped.
+fn fit_budget(entries: &mut [ChainEntry]) {
+    loop {
+        let excess = excess_bytes(entries);
+        if excess == 0 {
+            return;
+        }
+        let Some(longest) = entries
+            .iter_mut()
+            .filter(|e| e.cmdline.chars().count() > 1)
+            .max_by_key(|e| e.cmdline.chars().count())
+        else {
+            return;
+        };
+        let len = longest.cmdline.chars().count();
+        let step = (excess / 4).max(1);
+        let target = len.saturating_sub(step).max(1);
+        // The marker `…` of an already truncated entry is not kept text.
+        let prev_kept = len - usize::from(longest.truncated_chars > 0);
+        let mut shortened: String = longest.cmdline.chars().take(target - 1).collect();
+        shortened.push('…');
+        longest.truncated_chars += (prev_kept - (target - 1)) as u32;
+        longest.cmdline = shortened;
+    }
 }
 
 /// Convenience wrapper over the real `/proc`.
-pub fn system_command_line_for_caller(pid: u32, process_name: Option<&str>) -> String {
-    command_line_for_caller(&ProcTree::system(), pid, process_name)
+pub fn system_command_chain_for_caller(pid: u32, process_name: Option<&str>) -> CommandChain {
+    command_chain_for_caller(&ProcTree::system(), pid, process_name)
 }
 
 #[cfg(test)]
@@ -41,23 +158,314 @@ mod tests {
         fs::write(p.join("cmdline"), cmdline).unwrap();
     }
 
-    fn sudo_tree() -> (TempDir, ProcTree) {
+    fn pids(c: &CommandChain) -> Vec<u32> {
+        c.entries.iter().map(|e| e.pid).collect()
+    }
+
+    #[test]
+    fn normal_chain_to_pid_1() {
         let dir = TempDir::new();
+        add(&dir, 1, "systemd", 0, b"/sbin/init\0");
         add(&dir, 10, "bash", 1, b"-bash\0");
+        add(&dir, 60, "ssh", 10, b"ssh\0-p\x002222\0host.invalid\0");
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 60, Some("ssh"));
+        assert_eq!(pids(&c), [60, 10, 1]);
+        assert_eq!(c.end, ChainEnd::Root);
+        assert_eq!(c.entries[0].cmdline, "ssh -p 2222 host.invalid");
+        assert_eq!(c.entries[0].comm, "ssh");
+        assert_eq!(c.entries[0].ppid, Some(10));
+        assert_eq!(c.entries[2].ppid, Some(0));
+    }
+
+    #[test]
+    fn parent_exited() {
+        let dir = TempDir::new();
+        add(&dir, 60, "ssh", 10, b"ssh\0host.invalid\0");
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 60, None);
+        assert_eq!(pids(&c), [60]);
+        assert_eq!(c.end, ChainEnd::ParentExited);
+    }
+
+    #[test]
+    fn cycle() {
+        let dir = TempDir::new();
+        add(&dir, 2, "a", 3, b"a\0");
+        add(&dir, 3, "b", 4, b"b\0");
+        add(&dir, 4, "c", 2, b"c\0");
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 2, None);
+        assert_eq!(pids(&c), [2, 3, 4]);
+        assert_eq!(c.end, ChainEnd::Cycle);
+    }
+
+    #[test]
+    fn more_than_16_entries_is_depth_limited() {
+        let dir = TempDir::new();
+        for p in 2..=30u32 {
+            add(&dir, p, "p", p + 1, b"p\0");
+        }
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 2, None);
+        assert_eq!(c.entries.len(), MAX_CHAIN_ENTRIES);
+        assert_eq!(c.end, ChainEnd::DepthLimit);
+    }
+
+    #[test]
+    fn exactly_16_entries_ending_at_root_is_root() {
+        let dir = TempDir::new();
+        for p in 1..=16u32 {
+            add(&dir, p, "p", p - 1, b"p\0");
+        }
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 16, None);
+        assert_eq!(c.entries.len(), 16);
+        assert_eq!(c.end, ChainEnd::Root);
+    }
+
+    #[test]
+    fn size_budget_shortens_longest_cmdlines_only() {
+        let dir = TempDir::new();
+        let long = format!("{}\0", "x".repeat(900));
+        for p in 1..=16u32 {
+            add(&dir, p, "worker", p - 1, long.as_bytes());
+        }
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 16, None);
+        assert_eq!(c.entries.len(), 16);
+        assert!(serde_json::to_string(&c.entries).unwrap().len() <= MAX_CHAIN_BYTES);
+        for e in &c.entries {
+            assert!(e.cmdline.chars().count() <= MAX_ENTRY_CMDLINE_CHARS);
+            assert!(e.cmdline.ends_with('…'));
+            assert_eq!(e.comm, "worker");
+        }
+        assert_eq!(pids(&c), (1..=16).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn multibyte_cmdlines_fit_budget() {
+        let mut entries: Vec<ChainEntry> = (0..16u32)
+            .map(|i| ChainEntry {
+                pid: 100 - i,
+                ppid: Some(99 - i),
+                comm: "worker".into(),
+                truncated_chars: 0,
+                cmdline: if i % 2 == 0 {
+                    "\u{4e2d}\u{6587}".repeat(100)
+                } else {
+                    "\u{1F600}".repeat(200)
+                },
+            })
+            .collect();
+        assert!(serde_json::to_string(&entries).unwrap().len() > MAX_CHAIN_BYTES);
+        fit_budget(&mut entries);
+        assert!(serde_json::to_string(&entries).unwrap().len() <= MAX_CHAIN_BYTES);
+        assert_eq!(entries.len(), 16);
+        assert!(entries.iter().any(|e| e.truncated_chars > 0));
+        for (i, e) in entries.iter().enumerate() {
+            assert_eq!(e.comm, "worker");
+            // kept chars (without the marker) plus cut chars is the original 200
+            if e.truncated_chars > 0 {
+                assert!(e.cmdline.ends_with('…'));
+                assert_eq!(
+                    e.cmdline.chars().count() - 1 + e.truncated_chars as usize,
+                    200,
+                    "{i}"
+                );
+            } else {
+                assert_eq!(e.cmdline.chars().count(), 200, "{i}");
+            }
+        }
+    }
+
+    /// Everything the relay forwards besides the chain, at realistic (generous) sizes.
+    fn fcm_data_with(entries: &[ChainEntry]) -> serde_json::Value {
+        serde_json::json!({
+            "request_uuid": "6fbbce84-5aef-43c3-8cc7-469cbfd83109",
+            "encrypted_blob": "A".repeat(344),
+            "service_uuid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "uid": "4294967295",
+            "username": "u".repeat(32),
+            "pid": "4294967295",
+            "process_name": "p".repeat(15),
+            "access_timestamp_ms": "1760000000000",
+            "ephemeral_public_key": "B".repeat(700),
+            "service_name": "s".repeat(64),
+            "command_chain": serde_json::to_string(entries).unwrap(),
+            "chain_end": "depth_limit",
+        })
+    }
+
+    fn assert_relay_accepts(entries: &[ChainEntry]) {
+        assert!(entries.len() <= MAX_CHAIN_ENTRIES);
+        for e in entries {
+            assert!(e.cmdline.chars().count() <= MAX_ENTRY_CMDLINE_CHARS);
+            assert!(e.comm.chars().count() <= MAX_COMM_CHARS);
+        }
+        assert!(serde_json::to_string(entries).unwrap().len() <= MAX_CHAIN_BYTES);
+        let data = serde_json::to_string(&fcm_data_with(entries)).unwrap();
+        assert!(
+            data.len() <= MAX_FCM_DATA_BYTES,
+            "data is {} bytes",
+            data.len()
+        );
+    }
+
+    #[test]
+    fn worst_case_chains_always_pass_the_relay_limits() {
+        let dir = TempDir::new();
+        let cases: [(&str, String); 3] = [
+            ("emoji", "\u{1F600}".repeat(300)),
+            ("cjk", "\u{4e2d}\u{6587}".repeat(300)),
+            // quotes and backslashes double again when embedded in the FCM data
+            ("escapes", "\"\\".repeat(300)),
+        ];
+        for (n, (name, text)) in cases.iter().enumerate() {
+            let root = dir.path().join(format!("case{n}"));
+            std::fs::create_dir_all(&root).unwrap();
+            for p in 1..=20u32 {
+                let pid = 4_000_000_000 + p;
+                let d = root.join(pid.to_string());
+                std::fs::create_dir_all(&d).unwrap();
+                let ppid = if p == 1 { 0 } else { 4_000_000_000 + p - 1 };
+                std::fs::write(
+                    d.join("stat"),
+                    format!("{pid} (\u{4e2d}\u{6587}\u{1F600}comm) S {ppid} 0 0\n"),
+                )
+                .unwrap();
+                std::fs::write(d.join("cmdline"), format!("{text}\0")).unwrap();
+            }
+            let tree = ProcTree::with_root(&root);
+            let chain = command_chain_for_caller(&tree, 4_000_000_020, None);
+            assert_eq!(chain.entries.len(), MAX_CHAIN_ENTRIES, "{name}");
+            assert_eq!(chain.end, ChainEnd::DepthLimit, "{name}");
+            assert_relay_accepts(&chain.entries);
+        }
+    }
+
+    #[test]
+    fn untruncated_entries_report_zero() {
+        let dir = TempDir::new();
+        add(&dir, 1, "init", 0, b"init\0");
+        add(&dir, 5, "tool", 1, b"tool\0--flag\0");
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 5, None);
+        assert!(c.entries.iter().all(|e| e.truncated_chars == 0));
+    }
+
+    #[test]
+    fn per_entry_cap_counts_cut_chars_from_full_cmdline() {
+        let dir = TempDir::new();
+        add(&dir, 1, "init", 0, b"init\0");
+        // 500 chars: beyond the old 1000-char display cap is covered below
         add(
             &dir,
-            20,
-            "sudo",
-            10,
-            b"sudo\0systemctl\0restart\0example.service\0",
+            5,
+            "tool",
+            1,
+            format!("{}\0", "x".repeat(500)).as_bytes(),
         );
         add(
             &dir,
-            30,
-            "sudo",
-            20,
-            b"sudo\0systemctl\0restart\0example.service\0",
+            6,
+            "big",
+            5,
+            format!("{}\0", "y".repeat(3000)).as_bytes(),
         );
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 6, None);
+        assert_eq!(
+            c.entries[0].cmdline.chars().count(),
+            MAX_ENTRY_CMDLINE_CHARS
+        );
+        assert_eq!(c.entries[0].truncated_chars, 3000 - 199);
+        assert_eq!(c.entries[1].truncated_chars, 500 - 199);
+        assert_eq!(c.entries[2].truncated_chars, 0);
+    }
+
+    #[test]
+    fn proc_read_limit_is_the_counting_base() {
+        let dir = TempDir::new();
+        add(&dir, 1, "init", 0, b"init\0");
+        // /proc reads stop at 4096 bytes, so that is what gets counted
+        add(&dir, 5, "huge", 1, "z".repeat(10_000).as_bytes());
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 5, None);
+        assert_eq!(c.entries[0].truncated_chars, 4096 - 199);
+    }
+
+    #[test]
+    fn budget_shortening_adds_to_truncated_chars() {
+        let dir = TempDir::new();
+        // 16 entries of 900 chars: cap cuts 701 each, the budget cuts more
+        let long = format!("{}\0", "x".repeat(900));
+        for p in 1..=16u32 {
+            add(&dir, p, "worker", p - 1, long.as_bytes());
+        }
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 16, None);
+        for e in &c.entries {
+            assert_eq!(
+                e.cmdline.chars().count() - 1 + e.truncated_chars as usize,
+                900
+            );
+            assert!(e.truncated_chars > 701);
+        }
+    }
+
+    #[test]
+    fn short_cmdlines_are_untouched_by_budget() {
+        let dir = TempDir::new();
+        add(&dir, 1, "init", 0, b"init\0");
+        add(&dir, 5, "tool", 1, b"tool\0--flag\0");
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 5, None);
+        assert_eq!(c.entries[0].cmdline, "tool --flag");
+    }
+
+    #[test]
+    fn injection_in_argv_is_neutralised() {
+        let dir = TempDir::new();
+        add(&dir, 1, "init", 0, b"init\0");
+        add(
+            &dir,
+            5,
+            "evil",
+            1,
+            "evil\n\u{202E}approved\0\u{2066}x\0".as_bytes(),
+        );
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 5, None);
+        let line = &c.entries[0].cmdline;
+        assert!(!line.contains('\n'));
+        assert!(!line.contains('\u{202E}') && !line.contains('\u{2066}'));
+        assert!(line.contains('\u{FFFD}'));
+        let json = serde_json::to_string(&c.entries).unwrap();
+        assert!(!json.contains("\\n"));
+    }
+
+    #[test]
+    fn caller_exited() {
+        let dir = TempDir::new();
+        let tree = ProcTree::with_root(dir.path());
+        let c = command_chain_for_caller(&tree, 9999, Some("sudo-auth"));
+        assert_eq!(c.entries.len(), 1);
+        assert_eq!(c.entries[0].pid, 9999);
+        assert_eq!(c.entries[0].ppid, None);
+        assert_eq!(c.entries[0].comm, "sudo-auth");
+        assert_eq!(c.entries[0].cmdline, "");
+        assert_eq!(c.end, ChainEnd::ParentExited);
+    }
+
+    #[test]
+    fn sudo_chain_shows_all_layers() {
+        let dir = TempDir::new();
+        add(&dir, 1, "systemd", 0, b"/sbin/init\0");
+        add(&dir, 10, "bash", 1, b"-bash\0");
+        let sudo = b"sudo\0systemctl\0restart\0example.service\0";
+        add(&dir, 20, "sudo", 10, sudo);
+        add(&dir, 30, "sudo", 20, sudo);
         add(
             &dir,
             40,
@@ -72,45 +480,13 @@ mod tests {
             40,
             b"sudo-auth\0lookup\0service\0sudo\0",
         );
-        add(&dir, 60, "ssh", 10, b"ssh\0-p\x002222\0host.invalid\0");
         let tree = ProcTree::with_root(dir.path());
-        (dir, tree)
-    }
-
-    #[test]
-    fn ordinary_caller_uses_own_command_line() {
-        let (_d, tree) = sudo_tree();
+        let c = command_chain_for_caller(&tree, 50, Some("sudo-auth"));
+        assert_eq!(pids(&c), [50, 40, 30, 20, 10, 1]);
         assert_eq!(
-            command_line_for_caller(&tree, 60, Some("ssh")),
-            "ssh -p 2222 host.invalid"
-        );
-    }
-
-    #[test]
-    fn sudo_auth_uses_nearest_sudo_ancestor() {
-        let (_d, tree) = sudo_tree();
-        assert_eq!(
-            command_line_for_caller(&tree, 50, Some("sudo-auth")),
+            c.entries[3].cmdline,
             "sudo systemctl restart example.service"
         );
-    }
-
-    #[test]
-    fn sudo_auth_without_sudo_ancestor_falls_back_to_own() {
-        let dir = TempDir::new();
-        add(&dir, 5, "bash", 0, b"bash\0");
-        add(&dir, 6, "sudo-auth", 5, b"sudo-auth\0lookup\0");
-        let tree = ProcTree::with_root(dir.path());
-        assert_eq!(
-            command_line_for_caller(&tree, 6, Some("sudo-auth")),
-            "sudo-auth lookup"
-        );
-    }
-
-    #[test]
-    fn unknown_or_exited_pid_is_empty() {
-        let (_d, tree) = sudo_tree();
-        assert_eq!(command_line_for_caller(&tree, 9999, None), "");
-        assert_eq!(command_line_for_caller(&tree, 9999, Some("sudo-auth")), "");
+        assert_eq!(c.end, ChainEnd::Root);
     }
 }

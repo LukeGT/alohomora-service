@@ -21,7 +21,6 @@ use crate::{
     dbus_server::collection::Collection,
     error::{Error, Result},
     key_store::SecureKey,
-    process_cmdline,
     process_tree::ProcTree,
     secret_store::SecretStore,
 };
@@ -44,10 +43,10 @@ pub struct SecretAccessor<'a> {
     pub process_name: Optional<String>,
     // ms since epoch
     pub timestamp: i64,
-    /// Sanitised command line of the caller (see `caller_command`). Kept off
+    /// Sanitised process chain of the caller (see `caller_command`). Kept off
     /// the D-Bus wire so the `LastAccess` signature stays unchanged.
     #[serde(skip)]
-    pub cmdline: Optional<String>,
+    pub chain: Option<caller_command::CommandChain>,
 }
 
 impl<'a> Default for SecretAccessor<'a> {
@@ -59,13 +58,13 @@ impl<'a> Default for SecretAccessor<'a> {
             pid: 0,
             timestamp: 0,
             process_name: Optional::from(None),
-            cmdline: Optional::from(None),
+            chain: None,
         }
     }
 }
 
 // Hand-written because the derive ignores `#[serde(skip)]` and would put
-// `cmdline` into the signature while serialisation omits it.
+// `chain` into the signature while serialisation omits it.
 impl Type for SecretAccessor<'_> {
     fn signature() -> zbus::zvariant::Signature<'static> {
         zbus::zvariant::Signature::from_static_str_unchecked("(sususx)")
@@ -119,7 +118,7 @@ impl SecretAccessor<'static> {
             pid: 0,
             process_name: Optional::from(None),
             timestamp: Timestamp::now().as_millisecond(),
-            cmdline: Optional::from(None),
+            chain: None,
         }
     }
 
@@ -140,9 +139,10 @@ impl SecretAccessor<'static> {
                 })
             });
 
-        let cmdline = Some(process_cmdline::read_command_line(
-            ProcTree::system().root(),
+        let chain = Some(caller_command::command_chain_for_caller(
+            &ProcTree::system(),
             pid,
+            process_name.as_deref(),
         ));
 
         Self {
@@ -152,7 +152,7 @@ impl SecretAccessor<'static> {
             pid,
             process_name: process_name.into(),
             timestamp: Timestamp::now().as_millisecond(),
-            cmdline: cmdline.into(),
+            chain,
         }
     }
 
@@ -199,8 +199,8 @@ impl SecretAccessor<'static> {
         .unwrap();
 
         let name_for_cmdline = process_name.clone();
-        let cmdline = spawn_blocking(move || {
-            caller_command::system_command_line_for_caller(pid, name_for_cmdline.as_deref())
+        let chain = spawn_blocking(move || {
+            caller_command::system_command_chain_for_caller(pid, name_for_cmdline.as_deref())
         })
         .await
         .unwrap();
@@ -212,7 +212,7 @@ impl SecretAccessor<'static> {
             dbus_name: Optional::from(Some(name)),
             timestamp: Timestamp::now().as_millisecond(),
             process_name: process_name.into(),
-            cmdline: Some(cmdline).into(),
+            chain: Some(chain),
         })
     }
 }
@@ -591,7 +591,7 @@ mod tests {
         assert!(accessor.username.is_some());
         assert!(accessor.process_name.is_some());
         assert!(accessor.dbus_name.is_none());
-        assert!(!accessor.cmdline.as_ref().unwrap().is_empty());
+        assert!(!accessor.chain.as_ref().unwrap().entries.is_empty());
     }
 
     #[test]
@@ -603,11 +603,11 @@ mod tests {
         assert!(accessor.username.is_none());
         assert!(accessor.process_name.is_none());
         assert!(accessor.dbus_name.is_none());
-        assert!(accessor.cmdline.is_none());
+        assert!(accessor.chain.is_none());
     }
 
     #[test]
-    fn test_secret_accessor_dbus_signature_excludes_cmdline() {
+    fn test_secret_accessor_dbus_signature_excludes_chain() {
         // LastAccess is consumed over D-Bus by the CLI; adding the display-only
         // cmdline must not change the wire format.
         assert_eq!(
@@ -615,10 +615,10 @@ mod tests {
             "(sususx)"
         );
         let mut accessor = SecretAccessor::default();
-        accessor.cmdline = Some("ignored on the wire".to_string()).into();
+        accessor.chain = Some(caller_command::system_command_chain_for_caller(1, None));
         let ctx = zbus::zvariant::serialized::Context::new_dbus(zbus::zvariant::LE, 0);
         let bytes = zbus::zvariant::to_bytes(ctx, &accessor).unwrap();
         let (decoded, _): (SecretAccessor, _) = bytes.deserialize().unwrap();
-        assert!(decoded.cmdline.is_none());
+        assert!(decoded.chain.is_none());
     }
 }
