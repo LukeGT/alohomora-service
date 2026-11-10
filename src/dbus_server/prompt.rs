@@ -24,7 +24,7 @@ use zbus::{
     Connection, ObjectServer,
 };
 
-use crate::auth_gate::AuthGate;
+use crate::auth_gate::{ApprovalTarget, AuthGate};
 
 use super::{
     item::SecretAccessor,
@@ -47,6 +47,7 @@ pub struct PromptInner {
     path: OwnedObjectPath,
     caller: OwnedUniqueName,
     targets: Vec<Target>,
+    approval_targets: Vec<ApprovalTarget>,
     /// Paths reported as unlocked in `Completed`.
     result: Vec<OwnedObjectPath>,
     accessor: Option<SecretAccessor<'static>>,
@@ -61,6 +62,7 @@ pub struct PromptRequest {
     pub path: OwnedObjectPath,
     pub caller: OwnedUniqueName,
     pub targets: Vec<Target>,
+    pub approval_targets: Vec<ApprovalTarget>,
     pub result: Vec<OwnedObjectPath>,
     pub accessor: Option<SecretAccessor<'static>>,
 }
@@ -101,7 +103,7 @@ impl PromptInner {
     async fn run(&self) {
         let outcome = self
             .auth_gate
-            .request_secret_key(self.accessor.as_ref())
+            .request_secret_key(self.accessor.as_ref(), &self.approval_targets)
             .await;
         if self.take_done().is_none() {
             return;
@@ -188,6 +190,7 @@ impl Prompt {
             path: request.path,
             caller: request.caller,
             targets: request.targets,
+            approval_targets: request.approval_targets,
             result: request.result,
             accessor: request.accessor,
             auth_gate,

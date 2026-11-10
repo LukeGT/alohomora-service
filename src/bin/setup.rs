@@ -102,7 +102,7 @@ async fn main() -> ExitCode {
             None
         };
 
-        let secret_key_res = auth_gate.request_secret_key(None).await;
+        let secret_key_res = auth_gate.request_secret_key(None, &[]).await;
         if let Some(handle) = temp_http_server {
             handle.abort();
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;

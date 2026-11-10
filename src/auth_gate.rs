@@ -163,10 +163,23 @@ pub enum AuthAction {
     Delete,
 }
 
-impl AuthAction {
-    pub fn is_access(&self) -> bool {
-        *self == AuthAction::Access
-    }
+/// One secret named in an approval request, shown to the approver.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalTarget {
+    pub kind: TargetKind,
+    /// Label of the collection holding the secret (or being approved).
+    pub collection: String,
+    /// Item label; `None` for collections.
+    pub label: Option<String>,
+    #[serde(default)]
+    pub attributes: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetKind {
+    Item,
+    Collection,
 }
 
 /// A pending challenge for a local device, as served by
@@ -192,11 +205,12 @@ pub struct LocalChallenge {
     pub port: String,
     pub service_uuid: String,
     pub service_name: String,
-    /// Omitted for plain access requests.
-    #[serde(default, skip_serializing_if = "AuthAction::is_access")]
+    #[serde(default)]
     pub action: AuthAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_label: Option<String>,
+    #[serde(default)]
+    pub targets: Vec<ApprovalTarget>,
 }
 
 #[derive(Debug, Serialize)]
@@ -215,10 +229,9 @@ struct AndroidAuthPayload {
     port: String,
     service_uuid: String,
     service_name: String,
-    #[serde(default, skip_serializing_if = "AuthAction::is_access")]
     action: AuthAction,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     target_label: Option<String>,
+    targets: Vec<ApprovalTarget>,
 }
 
 impl AuthGate {
@@ -272,8 +285,9 @@ impl AuthGate {
     pub async fn request_secret_key(
         &self,
         accessor: Option<&SecretAccessor<'_>>,
+        targets: &[ApprovalTarget],
     ) -> Result<SecureKey> {
-        self.request_approval(accessor, AuthAction::Access, None)
+        self.request_approval(accessor, AuthAction::Access, None, targets)
             .await
     }
 
@@ -283,10 +297,16 @@ impl AuthGate {
         &self,
         label: &str,
         accessor: Option<&SecretAccessor<'_>>,
+        targets: &[ApprovalTarget],
     ) -> Result<()> {
-        self.request_approval(accessor, AuthAction::Delete, Some(label.to_string()))
-            .await
-            .map(drop)
+        self.request_approval(
+            accessor,
+            AuthAction::Delete,
+            Some(label.to_string()),
+            targets,
+        )
+        .await
+        .map(drop)
     }
 
     async fn request_approval(
@@ -294,6 +314,7 @@ impl AuthGate {
         accessor: Option<&SecretAccessor<'_>>,
         action: AuthAction,
         target_label: Option<String>,
+        targets: &[ApprovalTarget],
     ) -> Result<SecureKey> {
         let default_accessor;
         let accessor = match accessor {
@@ -474,6 +495,7 @@ impl AuthGate {
             let mut payload = payload;
             payload.action = action;
             payload.target_label = target_label.clone();
+            payload.targets = targets.to_vec();
 
             if device.kind == key_store::DeviceKind::Local {
                 // Local devices get no push notification: park the challenge
@@ -511,6 +533,7 @@ impl AuthGate {
                         service_name: payload.service_name,
                         action: payload.action,
                         target_label: payload.target_label.clone(),
+                        targets: payload.targets.clone(),
                     });
                 delivered += 1;
                 continue;
@@ -543,11 +566,10 @@ impl AuthGate {
                 "port": payload.port,
                 "service_uuid": payload.service_uuid,
                 "service_name": payload.service_name,
+                "action": payload.action,
+                "targets": payload.targets,
             });
 
-            if payload.action != AuthAction::Access {
-                request_body["action"] = serde_json::json!(payload.action);
-            }
             if let Some(label) = &payload.target_label {
                 request_body["target_label"] = serde_json::json!(label);
             }
@@ -704,6 +726,7 @@ impl AuthGate {
             service_name: service_identity.service_name.clone(),
             action: AuthAction::Access,
             target_label: None,
+            targets: Vec::new(),
         }
     }
 }
@@ -984,6 +1007,7 @@ mod tests {
                 service_name: field(),
                 action: AuthAction::Access,
                 target_label: None,
+                targets: Vec::new(),
             }],
         );
     }
@@ -1055,7 +1079,7 @@ mod tests {
 
         // the gate is configured to wait 60s for an answer
         let gate = test_gate();
-        let result = time::timeout(Duration::from_secs(20), gate.request_secret_key(None))
+        let result = time::timeout(Duration::from_secs(20), gate.request_secret_key(None, &[]))
             .await
             .expect("must not wait for the authorization timeout");
         assert!(matches!(result, Err(Error::PermissionDenied)));
@@ -1104,7 +1128,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = match auth_gate.request_secret_key(None).await {
+        let err = match auth_gate.request_secret_key(None, &[]).await {
             Ok(_) => panic!("expected request_secret_key to fail, but it succeeded"),
             Err(e) => e,
         };
@@ -1293,7 +1317,11 @@ mod tests {
 mod action_payload_tests {
     use super::*;
 
-    fn challenge(action: AuthAction, target_label: Option<String>) -> serde_json::Value {
+    fn challenge(
+        action: AuthAction,
+        target_label: Option<String>,
+        targets: Vec<ApprovalTarget>,
+    ) -> serde_json::Value {
         let field = String::new;
         serde_json::to_value(LocalChallenge {
             request_uuid: field(),
@@ -1314,20 +1342,47 @@ mod action_payload_tests {
             service_name: field(),
             action,
             target_label,
+            targets,
         })
         .unwrap()
     }
 
     #[test]
-    fn access_payload_omits_action_fields() {
-        let v = challenge(AuthAction::Access, None);
-        assert!(v.get("action").is_none());
+    fn access_payload_carries_action() {
+        let v = challenge(AuthAction::Access, None, Vec::new());
+        assert_eq!(v["action"], "access");
         assert!(v.get("target_label").is_none());
+        assert_eq!(v["targets"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn targets_serialize_in_full() {
+        let targets = vec![
+            ApprovalTarget {
+                kind: TargetKind::Item,
+                collection: "Login".into(),
+                label: Some("sudo".into()),
+                attributes: HashMap::from([("service".to_string(), "sudo".to_string())]),
+            },
+            ApprovalTarget {
+                kind: TargetKind::Collection,
+                collection: "Login".into(),
+                label: None,
+                attributes: HashMap::new(),
+            },
+        ];
+        let v = challenge(AuthAction::Access, None, targets);
+        assert_eq!(v["targets"][0]["kind"], "item");
+        assert_eq!(v["targets"][0]["collection"], "Login");
+        assert_eq!(v["targets"][0]["label"], "sudo");
+        assert_eq!(v["targets"][0]["attributes"]["service"], "sudo");
+        assert_eq!(v["targets"][1]["kind"], "collection");
+        assert!(v["targets"][1]["label"].is_null());
     }
 
     #[test]
     fn delete_payload_carries_action_and_label() {
-        let v = challenge(AuthAction::Delete, Some("my secret".into()));
+        let v = challenge(AuthAction::Delete, Some("my secret".into()), Vec::new());
         assert_eq!(v["action"], "delete");
         assert_eq!(v["target_label"], "my secret");
     }

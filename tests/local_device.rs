@@ -97,7 +97,7 @@ async fn local_device_register_unlock_round_trip() {
     });
 
     let gate = auth_gate.clone();
-    let requester = tokio::spawn(async move { gate.request_secret_key(None).await });
+    let requester = tokio::spawn(async move { gate.request_secret_key(None, &[]).await });
 
     let client = reqwest::Client::new();
     let url = format!("{server}/alohomora/local/challenges");

@@ -27,7 +27,7 @@ use crate::{
 
 use super::{
     collection::Collection,
-    item::{access_info_from_header, secret_key_for, Item},
+    item::{access_info_from_header, approval_targets, secret_key_for, Item},
     prompt::{watch_disconnects, Prompt, PromptRegistry, PromptRequest, MAX_PROMPTS_PER_CALLER},
     secret_transfer::{PlainTextTransfer, Secret},
     session::Session,
@@ -384,6 +384,7 @@ impl Service<'static> {
             PromptRequest {
                 path,
                 caller: caller.clone().into(),
+                approval_targets: approval_targets(self.store.as_ref(), &targets).await,
                 targets,
                 result: remaining,
                 accessor,
@@ -429,6 +430,7 @@ impl Service<'static> {
         let access_info = access_info_from_header(&header, connection).await?;
         // without a prior Unlock this blocks within the client's D-Bus timeout
         let secret_key = secret_key_for(
+            self.store.as_ref(),
             &self.auth_gate,
             &self.grants,
             &header,

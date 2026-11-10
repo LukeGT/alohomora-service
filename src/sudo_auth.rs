@@ -124,7 +124,7 @@ async fn handle_client(auth_gate: AuthGate, mut stream: UnixStream) {
     let (mut reader, mut writer) = stream.split();
     let mut byte = [0u8; 1];
     let approval = tokio::select! {
-        result = auth_gate.request_secret_key(Some(&accessor)) => result,
+        result = auth_gate.request_secret_key(Some(&accessor), &[]) => result,
         _ = reader.read(&mut byte) => {
             info!("Sudo approval: client for pid {pid} went away; cancelled its request");
             return;
