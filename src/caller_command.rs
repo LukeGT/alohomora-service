@@ -4,16 +4,29 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    process_cmdline::read_command_line_uncapped,
+    process_cmdline::{neutralise, read_command_line_uncapped},
     process_tree::{ChainEnd, ProcTree},
 };
 
+// Limits mirrored by the relay (alohomora-web-service `index.js`, constants of the
+// same names). The relay rejects anything over them instead of trimming, so
+// keep both sides in sync; the `worst_case_*` test below guarantees that what
+// this service produces always passes the relay.
+
 /// Maximum number of chain entries (caller included).
 pub const MAX_CHAIN_ENTRIES: usize = 16;
-/// Maximum characters of each entry's command line.
+/// Maximum code points of each entry's command line.
 pub const MAX_ENTRY_CMDLINE_CHARS: usize = 200;
-/// Maximum serialized size of the entry list in bytes (FCM allows 4096 total).
+/// Maximum code points of each entry's `comm`.
+pub const MAX_COMM_CHARS: usize = 32;
+/// Maximum serialized size of the entry list in bytes.
 pub const MAX_CHAIN_BYTES: usize = 2500;
+/// Maximum serialized size of the whole FCM data payload in bytes.
+pub const MAX_FCM_DATA_BYTES: usize = 4096;
+/// Service-side only: maximum size of the chain once embedded as an escaped JSON
+/// string value in the FCM data (quotes and backslashes double in size), leaving
+/// room for the other fields so the data payload stays within [`MAX_FCM_DATA_BYTES`].
+pub const MAX_CHAIN_EMBEDDED_BYTES: usize = 2600;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainEntry {
@@ -52,7 +65,7 @@ pub fn command_chain_for_caller(
                 pid: e.pid,
                 ppid: Some(e.ppid),
                 cmdline,
-                comm: e.comm,
+                comm: clean_comm(&e.comm),
                 truncated_chars,
             }
         })
@@ -61,13 +74,18 @@ pub fn command_chain_for_caller(
         entries.push(ChainEntry {
             pid,
             ppid: None,
-            comm: process_name.unwrap_or_default().to_string(),
+            comm: clean_comm(process_name.unwrap_or_default()),
             cmdline: String::new(),
             truncated_chars: 0,
         });
     }
     fit_budget(&mut entries);
     CommandChain { entries, end }
+}
+
+/// Neutralise control/bidi characters (kernel comm is attacker-settable) and cap length.
+fn clean_comm(comm: &str) -> String {
+    neutralise(comm).chars().take(MAX_COMM_CHARS).collect()
 }
 
 /// Apply the per-entry cap, returning the kept text and the chars cut.
@@ -82,16 +100,25 @@ fn cap_cmdline(full: String) -> (String, u32) {
     (text, (total - kept) as u32)
 }
 
-fn serialized_len(entries: &[ChainEntry]) -> usize {
-    serde_json::to_string(entries).map_or(usize::MAX, |s| s.len())
+/// Bytes by which the chain exceeds the budget (0 when it fits): both the plain
+/// serialized size and the size embedded as a string value in the FCM data count.
+fn excess_bytes(entries: &[ChainEntry]) -> usize {
+    let Ok(plain) = serde_json::to_string(entries) else {
+        return usize::MAX;
+    };
+    let embedded = serde_json::to_string(&plain).map_or(usize::MAX, |s| s.len());
+    plain
+        .len()
+        .saturating_sub(MAX_CHAIN_BYTES)
+        .max(embedded.saturating_sub(MAX_CHAIN_EMBEDDED_BYTES))
 }
 
 /// Shorten the longest command lines until the chain fits [`MAX_CHAIN_BYTES`].
 /// Entries, pids and comms are never dropped.
 fn fit_budget(entries: &mut [ChainEntry]) {
     loop {
-        let size = serialized_len(entries);
-        if size <= MAX_CHAIN_BYTES {
+        let excess = excess_bytes(entries);
+        if excess == 0 {
             return;
         }
         let Some(longest) = entries
@@ -102,7 +129,7 @@ fn fit_budget(entries: &mut [ChainEntry]) {
             return;
         };
         let len = longest.cmdline.chars().count();
-        let step = ((size - MAX_CHAIN_BYTES) / 4).max(1);
+        let step = (excess / 4).max(1);
         let target = len.saturating_sub(step).max(1);
         // The marker `…` of an already truncated entry is not kept text.
         let prev_kept = len - usize::from(longest.truncated_chars > 0);
@@ -249,6 +276,71 @@ mod tests {
             } else {
                 assert_eq!(e.cmdline.chars().count(), 200, "{i}");
             }
+        }
+    }
+
+    /// Everything the relay forwards besides the chain, at realistic (generous) sizes.
+    fn fcm_data_with(entries: &[ChainEntry]) -> serde_json::Value {
+        serde_json::json!({
+            "request_uuid": "6fbbce84-5aef-43c3-8cc7-469cbfd83109",
+            "encrypted_blob": "A".repeat(344),
+            "service_uuid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "uid": "4294967295",
+            "username": "u".repeat(32),
+            "pid": "4294967295",
+            "process_name": "p".repeat(15),
+            "access_timestamp_ms": "1760000000000",
+            "ephemeral_public_key": "B".repeat(700),
+            "service_name": "s".repeat(64),
+            "command_chain": serde_json::to_string(entries).unwrap(),
+            "chain_end": "depth_limit",
+        })
+    }
+
+    fn assert_relay_accepts(entries: &[ChainEntry]) {
+        assert!(entries.len() <= MAX_CHAIN_ENTRIES);
+        for e in entries {
+            assert!(e.cmdline.chars().count() <= MAX_ENTRY_CMDLINE_CHARS);
+            assert!(e.comm.chars().count() <= MAX_COMM_CHARS);
+        }
+        assert!(serde_json::to_string(entries).unwrap().len() <= MAX_CHAIN_BYTES);
+        let data = serde_json::to_string(&fcm_data_with(entries)).unwrap();
+        assert!(
+            data.len() <= MAX_FCM_DATA_BYTES,
+            "data is {} bytes",
+            data.len()
+        );
+    }
+
+    #[test]
+    fn worst_case_chains_always_pass_the_relay_limits() {
+        let dir = TempDir::new();
+        let cases: [(&str, String); 3] = [
+            ("emoji", "\u{1F600}".repeat(300)),
+            ("cjk", "\u{4e2d}\u{6587}".repeat(300)),
+            // quotes and backslashes double again when embedded in the FCM data
+            ("escapes", "\"\\".repeat(300)),
+        ];
+        for (n, (name, text)) in cases.iter().enumerate() {
+            let root = dir.path().join(format!("case{n}"));
+            std::fs::create_dir_all(&root).unwrap();
+            for p in 1..=20u32 {
+                let pid = 4_000_000_000 + p;
+                let d = root.join(pid.to_string());
+                std::fs::create_dir_all(&d).unwrap();
+                let ppid = if p == 1 { 0 } else { 4_000_000_000 + p - 1 };
+                std::fs::write(
+                    d.join("stat"),
+                    format!("{pid} (\u{4e2d}\u{6587}\u{1F600}comm) S {ppid} 0 0\n"),
+                )
+                .unwrap();
+                std::fs::write(d.join("cmdline"), format!("{text}\0")).unwrap();
+            }
+            let tree = ProcTree::with_root(&root);
+            let chain = command_chain_for_caller(&tree, 4_000_000_020, None);
+            assert_eq!(chain.entries.len(), MAX_CHAIN_ENTRIES, "{name}");
+            assert_eq!(chain.end, ChainEnd::DepthLimit, "{name}");
+            assert_relay_accepts(&chain.entries);
         }
     }
 

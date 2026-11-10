@@ -78,7 +78,7 @@ fn is_bidi_or_separator(c: char) -> bool {
 }
 
 /// Replace control characters (newline, ESC, C1, ...) and bidi controls with U+FFFD.
-fn neutralise(s: &str) -> String {
+pub(crate) fn neutralise(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_control() || is_bidi_or_separator(c) {
