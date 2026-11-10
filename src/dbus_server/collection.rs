@@ -18,7 +18,7 @@ use crate::{
 };
 
 use super::{
-    item::{access_info_from_header, secret_key_for, Item},
+    item::{access_info_from_header, delete_approval_for, secret_key_for, Item},
     session::Session,
     unlock_grants::{Target, UnlockGrants},
     utils::{
@@ -147,6 +147,20 @@ impl Collection<'static> {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "[unknown ID]".into())
         );
+        let label = self
+            .store
+            .get_label(self.id.clone())
+            .await
+            .unwrap_or_else(|_| self.id.to_string());
+        let access_info = access_info_from_header(&header, connection).await?;
+        delete_approval_for(
+            &self.auth_gate,
+            &self.grants,
+            &header,
+            &label,
+            access_info.as_ref(),
+        )
+        .await?;
         let secrets = self.store.list_secrets(&*self.id).await?;
 
         // remove this collection from the object server
