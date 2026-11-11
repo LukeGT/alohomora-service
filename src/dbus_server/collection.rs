@@ -154,6 +154,8 @@ impl Collection<'static> {
             .unwrap_or_else(|_| self.id.to_string());
         let access_info = access_info_from_header(&header, connection).await?;
         delete_approval_for(
+            self.store.as_ref(),
+            &self.target(),
             &self.auth_gate,
             &self.grants,
             &header,
@@ -240,6 +242,7 @@ impl Collection<'static> {
 
         let access_info = access_info_from_header(&header, connection).await?;
         let secret_key = secret_key_for(
+            self.store.as_ref(),
             &self.auth_gate,
             &self.grants,
             &header,

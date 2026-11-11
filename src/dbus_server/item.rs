@@ -16,7 +16,7 @@ use zbus::{
 };
 
 use crate::{
-    auth_gate::AuthGate,
+    auth_gate::{ApprovalTarget, AuthGate, TargetKind},
     caller_command,
     dbus_server::collection::Collection,
     error::{Error, Result},
@@ -261,6 +261,7 @@ impl<'a> Item<'a> {
         session.check_owner(header)?;
         let access_info = access_info_from_header(header, connection).await?;
         let secret_key = secret_key_for(
+            self.store.as_ref(),
             &self.auth_gate,
             &self.grants,
             header,
@@ -326,7 +327,50 @@ pub(crate) async fn access_info_from_header(
 /// The secret key from the caller's unlock grant, or else a blocking phone
 /// approval (bounded by the client's D-Bus timeout, typically 25s), which is
 /// cancelled if the caller leaves the bus.
+/// Resolve ids to the labels and attributes the approver sees. Lookup
+/// failures degrade to the raw id rather than blocking the request.
+pub(crate) async fn approval_targets(
+    store: &(dyn SecretStore<'_> + Send + Sync),
+    targets: &[Target],
+) -> Vec<ApprovalTarget> {
+    let mut out = Vec::with_capacity(targets.len());
+    for target in targets {
+        let (collection_id, item_id) = match target {
+            Target::Collection(c) => (c, None),
+            Target::Item { collection, item } => (collection, Some(item)),
+        };
+        let collection = store
+            .get_label(collection_id.clone())
+            .await
+            .unwrap_or_else(|_| collection_id.to_string());
+        out.push(match item_id {
+            None => ApprovalTarget {
+                kind: TargetKind::Collection,
+                collection,
+                label: None,
+                attributes: Default::default(),
+            },
+            Some(item) => ApprovalTarget {
+                kind: TargetKind::Item,
+                collection,
+                label: Some(
+                    store
+                        .get_secret_label(collection_id.clone(), item.clone())
+                        .await
+                        .unwrap_or_else(|_| item.to_string()),
+                ),
+                attributes: store
+                    .read_secret_attrs(collection_id.clone(), item.clone())
+                    .await
+                    .unwrap_or_default(),
+            },
+        });
+    }
+    out
+}
+
 pub(crate) async fn secret_key_for(
+    store: &(dyn SecretStore<'_> + Send + Sync),
     auth_gate: &AuthGate,
     grants: &UnlockGrants,
     header: &Header<'_>,
@@ -334,15 +378,17 @@ pub(crate) async fn secret_key_for(
     access_info: Option<&SecretAccessor<'_>>,
 ) -> Result<SecureKey> {
     let Some(sender) = header.sender() else {
-        return auth_gate.request_secret_key(access_info).await;
+        let resolved = approval_targets(store, targets).await;
+        return auth_gate.request_secret_key(access_info, &resolved).await;
     };
     if let Some(key) = grants.take(sender, targets) {
         debug!("Using unlock grant for {sender}");
         return Ok(key);
     }
+    let resolved = approval_targets(store, targets).await;
     let gone = grants.disconnected(sender.as_str());
     tokio::select! {
-        result = auth_gate.request_secret_key(access_info) => result,
+        result = auth_gate.request_secret_key(access_info, &resolved) => result,
         () = gone => {
             info!("{sender} left the bus; cancelled its approval request");
             Err(Error::PermissionDenied)
@@ -353,18 +399,23 @@ pub(crate) async fn secret_key_for(
 /// Phone approval for a delete. Unlike reads, unlock grants never satisfy it.
 /// Cancelled if the caller leaves the bus.
 pub(crate) async fn delete_approval_for(
+    store: &(dyn SecretStore<'_> + Send + Sync),
+    target: &Target,
     auth_gate: &AuthGate,
     grants: &UnlockGrants,
     header: &Header<'_>,
     label: &str,
     access_info: Option<&SecretAccessor<'_>>,
 ) -> Result<()> {
+    let resolved = approval_targets(store, std::slice::from_ref(target)).await;
     let Some(sender) = header.sender() else {
-        return auth_gate.request_delete_approval(label, access_info).await;
+        return auth_gate
+            .request_delete_approval(label, access_info, &resolved)
+            .await;
     };
     let gone = grants.disconnected(sender.as_str());
     tokio::select! {
-        result = auth_gate.request_delete_approval(label, access_info) => result,
+        result = auth_gate.request_delete_approval(label, access_info, &resolved) => result,
         () = gone => {
             info!("{sender} left the bus; cancelled its delete approval request");
             Err(Error::PermissionDenied)
@@ -445,6 +496,8 @@ impl Item<'static> {
             .unwrap_or_else(|_| self.id.to_string());
         let access_info = access_info_from_header(&header, connection).await?;
         delete_approval_for(
+            self.store.as_ref(),
+            &self.target(),
             &self.auth_gate,
             &self.grants,
             &header,
@@ -525,6 +578,7 @@ impl Item<'static> {
 
         let access_info = access_info_from_header(&header, connection).await?;
         let secret_key = secret_key_for(
+            self.store.as_ref(),
             &self.auth_gate,
             &self.grants,
             &header,
