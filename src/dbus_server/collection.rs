@@ -147,11 +147,6 @@ impl Collection<'static> {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "[unknown ID]".into())
         );
-        let label = self
-            .store
-            .get_label(self.id.clone())
-            .await
-            .unwrap_or_else(|_| self.id.to_string());
         let access_info = access_info_from_header(&header, connection).await?;
         delete_approval_for(
             self.store.as_ref(),
@@ -159,7 +154,6 @@ impl Collection<'static> {
             &self.auth_gate,
             &self.grants,
             &header,
-            &label,
             access_info.as_ref(),
         )
         .await?;

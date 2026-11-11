@@ -155,10 +155,9 @@ struct AuthGateInner {
 }
 
 /// What the phone is being asked to approve.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthAction {
-    #[default]
     Access,
     Delete,
 }
@@ -205,11 +204,7 @@ pub struct LocalChallenge {
     pub port: String,
     pub service_uuid: String,
     pub service_name: String,
-    #[serde(default)]
     pub action: AuthAction,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_label: Option<String>,
-    #[serde(default)]
     pub targets: Vec<ApprovalTarget>,
 }
 
@@ -230,7 +225,6 @@ struct AndroidAuthPayload {
     service_uuid: String,
     service_name: String,
     action: AuthAction,
-    target_label: Option<String>,
     targets: Vec<ApprovalTarget>,
 }
 
@@ -287,7 +281,7 @@ impl AuthGate {
         accessor: Option<&SecretAccessor<'_>>,
         targets: &[ApprovalTarget],
     ) -> Result<SecureKey> {
-        self.request_approval(accessor, AuthAction::Access, None, targets)
+        self.request_approval(accessor, AuthAction::Access, targets)
             .await
     }
 
@@ -295,25 +289,18 @@ impl AuthGate {
     /// apply; the returned key is discarded.
     pub async fn request_delete_approval(
         &self,
-        label: &str,
         accessor: Option<&SecretAccessor<'_>>,
         targets: &[ApprovalTarget],
     ) -> Result<()> {
-        self.request_approval(
-            accessor,
-            AuthAction::Delete,
-            Some(label.to_string()),
-            targets,
-        )
-        .await
-        .map(drop)
+        self.request_approval(accessor, AuthAction::Delete, targets)
+            .await
+            .map(drop)
     }
 
     async fn request_approval(
         &self,
         accessor: Option<&SecretAccessor<'_>>,
         action: AuthAction,
-        target_label: Option<String>,
         targets: &[ApprovalTarget],
     ) -> Result<SecureKey> {
         let default_accessor;
@@ -494,7 +481,6 @@ impl AuthGate {
             );
             let mut payload = payload;
             payload.action = action;
-            payload.target_label = target_label.clone();
             payload.targets = targets.to_vec();
 
             if device.kind == key_store::DeviceKind::Local {
@@ -532,7 +518,6 @@ impl AuthGate {
                         service_uuid: payload.service_uuid,
                         service_name: payload.service_name,
                         action: payload.action,
-                        target_label: payload.target_label.clone(),
                         targets: payload.targets.clone(),
                     });
                 delivered += 1;
@@ -569,10 +554,6 @@ impl AuthGate {
                 "action": payload.action,
                 "targets": payload.targets,
             });
-
-            if let Some(label) = &payload.target_label {
-                request_body["target_label"] = serde_json::json!(label);
-            }
 
             let client = reqwest::Client::new();
             let url = &self.inner.notification_url;
@@ -725,7 +706,6 @@ impl AuthGate {
             service_uuid: service_identity.service_uuid.clone(),
             service_name: service_identity.service_name.clone(),
             action: AuthAction::Access,
-            target_label: None,
             targets: Vec::new(),
         }
     }
@@ -1006,7 +986,6 @@ mod tests {
                 service_uuid: field(),
                 service_name: field(),
                 action: AuthAction::Access,
-                target_label: None,
                 targets: Vec::new(),
             }],
         );
@@ -1232,7 +1211,7 @@ mod tests {
             "encrypted_blob": "b", "ephemeral_public_key": "e", "uid": "1",
             "username": "u", "pid": "2", "process_name": "p",
             "access_timestamp_ms": "3", "domain": "x", "port": "443",
-            "service_uuid": "s", "service_name": "h"
+            "service_uuid": "s", "service_name": "h", "action": "access", "targets": []
         });
         let challenge: LocalChallenge = serde_json::from_value(old).unwrap();
         assert!(challenge.command_chain.is_empty());
@@ -1317,11 +1296,7 @@ mod tests {
 mod action_payload_tests {
     use super::*;
 
-    fn challenge(
-        action: AuthAction,
-        target_label: Option<String>,
-        targets: Vec<ApprovalTarget>,
-    ) -> serde_json::Value {
+    fn challenge(action: AuthAction, targets: Vec<ApprovalTarget>) -> serde_json::Value {
         let field = String::new;
         serde_json::to_value(LocalChallenge {
             request_uuid: field(),
@@ -1341,7 +1316,6 @@ mod action_payload_tests {
             service_uuid: field(),
             service_name: field(),
             action,
-            target_label,
             targets,
         })
         .unwrap()
@@ -1349,9 +1323,8 @@ mod action_payload_tests {
 
     #[test]
     fn access_payload_carries_action() {
-        let v = challenge(AuthAction::Access, None, Vec::new());
+        let v = challenge(AuthAction::Access, Vec::new());
         assert_eq!(v["action"], "access");
-        assert!(v.get("target_label").is_none());
         assert_eq!(v["targets"], serde_json::json!([]));
     }
 
@@ -1371,7 +1344,7 @@ mod action_payload_tests {
                 attributes: HashMap::new(),
             },
         ];
-        let v = challenge(AuthAction::Access, None, targets);
+        let v = challenge(AuthAction::Access, targets);
         assert_eq!(v["targets"][0]["kind"], "item");
         assert_eq!(v["targets"][0]["collection"], "Login");
         assert_eq!(v["targets"][0]["label"], "sudo");
@@ -1381,9 +1354,8 @@ mod action_payload_tests {
     }
 
     #[test]
-    fn delete_payload_carries_action_and_label() {
-        let v = challenge(AuthAction::Delete, Some("my secret".into()), Vec::new());
+    fn delete_payload_carries_action() {
+        let v = challenge(AuthAction::Delete, Vec::new());
         assert_eq!(v["action"], "delete");
-        assert_eq!(v["target_label"], "my secret");
     }
 }
