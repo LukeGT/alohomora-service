@@ -404,18 +404,17 @@ pub(crate) async fn delete_approval_for(
     auth_gate: &AuthGate,
     grants: &UnlockGrants,
     header: &Header<'_>,
-    label: &str,
     access_info: Option<&SecretAccessor<'_>>,
 ) -> Result<()> {
     let resolved = approval_targets(store, std::slice::from_ref(target)).await;
     let Some(sender) = header.sender() else {
         return auth_gate
-            .request_delete_approval(label, access_info, &resolved)
+            .request_delete_approval(access_info, &resolved)
             .await;
     };
     let gone = grants.disconnected(sender.as_str());
     tokio::select! {
-        result = auth_gate.request_delete_approval(label, access_info, &resolved) => result,
+        result = auth_gate.request_delete_approval(access_info, &resolved) => result,
         () = gone => {
             info!("{sender} left the bus; cancelled its delete approval request");
             Err(Error::PermissionDenied)
@@ -489,11 +488,6 @@ impl Item<'static> {
         #[zbus(header)] header: Header<'_>,
         #[zbus(object_server)] object_server: &ObjectServer,
     ) -> Result<ObjectPath<'_>> {
-        let label = self
-            .store
-            .get_secret_label(self.collection_id.clone(), self.id.clone())
-            .await
-            .unwrap_or_else(|_| self.id.to_string());
         let access_info = access_info_from_header(&header, connection).await?;
         delete_approval_for(
             self.store.as_ref(),
@@ -501,7 +495,6 @@ impl Item<'static> {
             &self.auth_gate,
             &self.grants,
             &header,
-            &label,
             access_info.as_ref(),
         )
         .await?;

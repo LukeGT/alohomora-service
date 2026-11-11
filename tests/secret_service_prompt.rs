@@ -879,7 +879,8 @@ async fn item_delete_times_out_without_approval() {
         challenge.action,
         pass_secret_service::auth_gate::AuthAction::Delete
     );
-    assert_eq!(challenge.target_label.as_deref(), Some("delete-b"));
+    assert_eq!(challenge.targets.len(), 1);
+    assert_eq!(challenge.targets[0].label.as_deref(), Some("delete-b"));
 
     assert_access_denied(delete.await.unwrap());
     let (unlocked, locked) = search(&client, "delete-b").await;
