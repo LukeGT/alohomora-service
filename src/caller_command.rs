@@ -9,7 +9,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    process_cmdline::{neutralise, read_cmdline_raw, sanitise_command_line, truncate_chars},
+    process_cmdline::{neutralise, read_cmdline_raw, sanitise_command_line},
     process_tree::{ChainEnd, ProcTree},
 };
 
@@ -56,6 +56,7 @@ pub struct ChainEntry {
 /// Spoofing evidence for one process. At least one field is set whenever this
 /// is present (see [`Spoof::detect`]); unset fields are omitted when serialised.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawSpoof")]
 pub struct Spoof {
     /// Real executable path (`/proc/<pid>/exe`), present when `argv[0]` names a
     /// different program.
@@ -65,6 +66,41 @@ pub struct Spoof {
     /// may show memory the program chose rather than its real arguments.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub args_moved: bool,
+}
+
+/// Wire shape of [`Spoof`], validated on deserialise so an empty one cannot exist.
+#[derive(Deserialize)]
+struct RawSpoof {
+    #[serde(default)]
+    exe: Option<String>,
+    #[serde(default)]
+    args_moved: bool,
+}
+
+impl TryFrom<RawSpoof> for Spoof {
+    type Error = &'static str;
+
+    fn try_from(raw: RawSpoof) -> Result<Self, Self::Error> {
+        if raw.exe.is_none() && !raw.args_moved {
+            return Err("spoof must carry exe or args_moved");
+        }
+        Ok(Self {
+            exe: raw.exe,
+            args_moved: raw.args_moved,
+        })
+    }
+}
+
+/// `s` unchanged if within `max` chars, else `…` plus its last `max - 1` chars
+/// (the end of a path is the informative part).
+fn keep_tail(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_owned();
+    }
+    std::iter::once('…')
+        .chain(s.chars().skip(count - (max - 1)))
+        .collect()
 }
 
 impl Spoof {
@@ -78,9 +114,7 @@ impl Spoof {
             .exe(pid)
             .zip(argv0)
             .filter(|(exe, argv0)| argv0_mismatches_exe(tree, pid, argv0, exe))
-            .map(|(exe, _)| {
-                truncate_chars(neutralise(&exe.to_string_lossy()), MAX_SPOOF_EXE_CHARS)
-            });
+            .map(|(exe, _)| keep_tail(&neutralise(&exe.to_string_lossy()), MAX_SPOOF_EXE_CHARS));
         let args_moved = tree.arg_area_moved(pid) == Some(true);
         (exe.is_some() || args_moved).then_some(Self { exe, args_moved })
     }
@@ -110,17 +144,19 @@ fn argv0_mismatches_exe(tree: &ProcTree, pid: u32, argv0: &str, exe: &Path) -> b
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
     let exe_name = exe_name.strip_suffix(" (deleted)").unwrap_or(&exe_name);
-    // setproctitle-style `sshd: user/0` keeps the program name as first token.
+    // Whole argv[0] first (paths may contain spaces); setproctitle-style
+    // `sshd: user/0` falls back to its first token, which keeps the program name.
     let first_token = argv0.split(' ').next().unwrap_or(argv0);
-    let first_token = first_token.strip_suffix(':').unwrap_or(first_token);
-    let arg_name = base_name(first_token).trim_start_matches('-');
-    if arg_name.is_empty() || exe_name.is_empty() {
-        return false;
-    }
-    if is_name_variant(arg_name, exe_name) || is_name_variant(exe_name, arg_name) {
-        return false;
-    }
-    !resolves_like_a_shell_to_exe(tree, pid, first_token)
+    let accepts = |candidate: &str| {
+        let candidate = candidate.strip_suffix(':').unwrap_or(candidate);
+        let arg_name = base_name(candidate).trim_start_matches('-');
+        arg_name.is_empty()
+            || exe_name.is_empty()
+            || is_name_variant(arg_name, exe_name)
+            || is_name_variant(exe_name, arg_name)
+            || resolves_like_a_shell_to_exe(tree, pid, candidate)
+    };
+    !(accepts(argv0) || accepts(first_token))
 }
 
 /// Path inside the process's own mount namespace, reached through `/proc/<pid>/root`.
@@ -317,7 +353,7 @@ fn shorten_longest_exe(entries: &mut [ChainEntry], excess: usize) {
         };
         let len = exe.chars().count();
         let target = len.saturating_sub((excess / 4).max(1)).max(2);
-        *exe = exe.chars().take(target - 1).chain(Some('…')).collect();
+        *exe = keep_tail(exe, target);
         if excess_bytes(entries) == 0 {
             return;
         }
@@ -590,6 +626,31 @@ mod tests {
         symlink(&real, &link).unwrap();
         let got = spoof_of(link.to_str().unwrap(), real.to_str().unwrap(), CONTIGUOUS);
         assert_eq!(got, None);
+    }
+
+    #[test]
+    fn argv0_path_with_spaces_is_matched_whole() {
+        assert_eq!(
+            spoof_of("/opt/My App/bin/app", "/usr/bin/app", CONTIGUOUS),
+            None
+        );
+        assert!(spoof_of("/opt/My App/bin/app", "/usr/bin/other", CONTIGUOUS).is_some());
+    }
+
+    #[test]
+    fn long_exe_keeps_its_tail() {
+        let long = format!("/{}/evil", "d".repeat(100));
+        let got = spoof_of("ssh", &long, CONTIGUOUS).unwrap().exe.unwrap();
+        assert_eq!(got.chars().count(), MAX_SPOOF_EXE_CHARS);
+        assert!(got.starts_with('…') && got.ends_with("/evil"));
+    }
+
+    #[test]
+    fn empty_spoof_does_not_deserialise() {
+        assert!(serde_json::from_str::<Spoof>("{}").is_err());
+        let entry = r#"{"pid":1,"ppid":0,"comm":"a","cmdline":"b","spoof":{}}"#;
+        assert!(serde_json::from_str::<ChainEntry>(entry).is_err());
+        assert!(serde_json::from_str::<Spoof>(r#"{"args_moved":true}"#).is_ok());
     }
 
     #[test]
