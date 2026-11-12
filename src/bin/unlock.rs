@@ -113,6 +113,14 @@ async fn run(args: Args) -> Result<(), String> {
                 &entry.cmdline
             };
             println!("  {}: {}", if i == 0 { "command" } else { "parent " }, text);
+            if let Some(spoof) = &entry.spoof {
+                if let Some(exe) = &spoof.exe {
+                    println!("    WARNING: argv[0] differs from the real executable: {exe}");
+                }
+                if spoof.args_moved {
+                    println!("    WARNING: argument area was remapped, command line may be fake");
+                }
+            }
         }
         let response: AuthenticateRequest =
             match local_device::answer_challenge(&device_key, &challenge) {

@@ -1229,6 +1229,7 @@ mod tests {
                     comm: "tool".into(),
                     cmdline: "tool --flag value".into(),
                     truncated_chars: 7,
+                    spoof: None,
                 },
                 ChainEntry {
                     pid: 1,
@@ -1236,6 +1237,7 @@ mod tests {
                     comm: "systemd".into(),
                     cmdline: String::new(),
                     truncated_chars: 0,
+                    spoof: None,
                 },
             ],
             end: ChainEnd::Root,
