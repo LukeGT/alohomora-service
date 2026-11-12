@@ -29,9 +29,14 @@ pub fn read_command_line(proc_root: &Path, pid: u32) -> String {
 /// count what they cut themselves. Only the byte limit of the `/proc` read
 /// ([`MAX_CMDLINE_READ_BYTES`]) still applies.
 pub fn read_command_line_uncapped(proc_root: &Path, pid: u32) -> String {
-    let path = proc_root.join(pid.to_string()).join("cmdline");
-    let Ok(file) = File::open(path) else {
-        return String::new();
+    sanitise_command_line(&read_cmdline_raw(proc_root, pid))
+}
+
+/// Raw NUL-separated `/proc/<pid>/cmdline` bytes (at most [`MAX_CMDLINE_READ_BYTES`]);
+/// empty if missing or unreadable.
+pub fn read_cmdline_raw(proc_root: &Path, pid: u32) -> Vec<u8> {
+    let Ok(file) = File::open(proc_root.join(pid.to_string()).join("cmdline")) else {
+        return Vec::new();
     };
     let mut buf = Vec::new();
     if file
@@ -39,9 +44,9 @@ pub fn read_command_line_uncapped(proc_root: &Path, pid: u32) -> String {
         .read_to_end(&mut buf)
         .is_err()
     {
-        return String::new();
+        return Vec::new();
     }
-    sanitise_command_line(&buf)
+    buf
 }
 
 /// Turn raw NUL-separated `cmdline` bytes into a single safe display string.
@@ -49,7 +54,7 @@ pub fn format_command_line(raw: &[u8]) -> String {
     truncate_chars(sanitise_command_line(raw), MAX_CMDLINE_CHARS)
 }
 
-fn sanitise_command_line(raw: &[u8]) -> String {
+pub(crate) fn sanitise_command_line(raw: &[u8]) -> String {
     let args: Vec<_> = raw
         .split(|&b| b == 0)
         // trailing NUL yields one empty tail element; drop empties at the end only

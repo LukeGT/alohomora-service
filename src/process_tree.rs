@@ -55,11 +55,30 @@ impl ProcTree {
         &self.root
     }
 
+    /// `<root>/<pid>`: where this process's `/proc` files (and `root`, `cwd`) live.
+    pub fn pid_dir(&self, pid: u32) -> PathBuf {
+        self.root.join(pid.to_string())
+    }
+
     /// Read and parse `<root>/<pid>/stat`. Returns `None` if the process is
     /// gone or the file cannot be parsed.
     pub fn entry(&self, pid: u32) -> Option<ProcessEntry> {
         let raw = fs::read(self.root.join(pid.to_string()).join("stat")).ok()?;
         parse_stat(pid, &raw)
+    }
+
+    /// Target of `<root>/<pid>/exe`; `None` if unreadable (kernel thread, no permission, gone).
+    pub fn exe(&self, pid: u32) -> Option<PathBuf> {
+        fs::read_link(self.root.join(pid.to_string()).join("exe")).ok()
+    }
+
+    /// Whether the argument area of `pid` was remapped: the kernel keeps the
+    /// environment directly after the arguments, so `arg_end != env_start`
+    /// (stat fields 49 and 50) means `prctl(PR_SET_MM_*)` or similar moved it.
+    /// `None` if the fields are missing or zero.
+    pub fn arg_area_moved(&self, pid: u32) -> Option<bool> {
+        let raw = fs::read(self.root.join(pid.to_string()).join("stat")).ok()?;
+        parse_arg_area_moved(&raw)
     }
 
     pub fn parent_pid(&self, pid: u32) -> Option<u32> {
@@ -137,6 +156,27 @@ impl Iterator for Ancestors<'_> {
         self.next = Some(entry.ppid);
         Some(entry)
     }
+}
+
+/// Fields 48-51 of stat are arg_start, arg_end, env_start, env_end. Parsed
+/// after the last `)` (index 0 there is field 3).
+fn parse_arg_area_moved(raw: &[u8]) -> Option<bool> {
+    let close = raw.iter().rposition(|&b| b == b')')?;
+    let rest = std::str::from_utf8(&raw[close + 1..]).ok()?;
+    let f: Vec<u64> = rest
+        .split_whitespace()
+        .skip(45)
+        .take(4)
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let [arg_start, arg_end, env_start, env_end] = f[..] else {
+        return None;
+    };
+    if [arg_start, arg_end, env_start, env_end].contains(&0) {
+        return None;
+    }
+    Some(arg_end != env_start)
 }
 
 /// Parse the contents of a `/proc/<pid>/stat` file.
@@ -299,5 +339,47 @@ mod tests {
         let me = tree.entry(std::process::id()).unwrap();
         assert_eq!(tree.parent_pid(me.pid), Some(me.ppid));
         assert!(!me.comm.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod arg_area_tests {
+    use super::*;
+
+    fn stat(comm: &str, tail: &str) -> Vec<u8> {
+        // fields 3..=47 filler (45 values), then fields 48..=51
+        let filler = vec!["0"; 45].join(" ");
+        format!("7 ({comm}) S {} {tail}\n", &filler[2..]).into_bytes()
+    }
+
+    #[test]
+    fn contiguous_area_is_not_moved() {
+        assert_eq!(
+            parse_arg_area_moved(&stat("sh", "100 200 200 300")),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn gap_between_args_and_env_is_moved() {
+        assert_eq!(
+            parse_arg_area_moved(&stat("sh", "100 200 900 1000")),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn comm_with_parens_and_spaces_is_handled() {
+        assert_eq!(
+            parse_arg_area_moved(&stat("a) (b c", "1 2 3 4")),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn missing_or_zero_fields_give_none() {
+        assert_eq!(parse_arg_area_moved(b"7 (sh) S 1 0 0\n"), None);
+        assert_eq!(parse_arg_area_moved(&stat("sh", "0 0 0 0")), None);
+        assert_eq!(parse_arg_area_moved(&stat("sh", "1 2 3")), None);
     }
 }
