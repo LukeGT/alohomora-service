@@ -47,14 +47,19 @@ pub struct ChainEntry {
     /// `/proc` read itself stopped at 4096 bytes, counting starts from what was read.
     #[serde(default)]
     pub truncated_chars: u32,
-    /// Kernel-backed evidence that the displayed `cmdline`/`comm` is not what runs.
-    /// Absent when nothing suspicious was found.
+    /// Best-effort evidence that the displayed `cmdline`/`comm` is not what runs
+    /// (see [`Spoof`] for what it cannot catch). Absent when nothing suspicious was found.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spoof: Option<Spoof>,
 }
 
 /// Spoofing evidence for one process. At least one field is set whenever this
 /// is present (see [`Spoof::detect`]); unset fields are omitted when serialised.
+///
+/// Not a security boundary: a process can name its binary like the program it
+/// imitates, and an unprivileged process can use `prctl(PR_SET_MM, PR_SET_MM_MAP)`
+/// (`CONFIG_CHECKPOINT_RESTORE`) to move its argument area while keeping
+/// `arg_end == env_start`. The full fix is capturing argv at exec time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawSpoof")]
 pub struct Spoof {
@@ -64,6 +69,8 @@ pub struct Spoof {
     pub exe: Option<String>,
     /// The argument area was remapped (`arg_end != env_start`), so `cmdline`
     /// may show memory the program chose rather than its real arguments.
+    /// Only catches naive remaps: `prctl(PR_SET_MM, PR_SET_MM_MAP)` can move the area
+    /// while keeping `arg_end == env_start`, so absence of this flag proves nothing.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub args_moved: bool,
 }
@@ -108,7 +115,6 @@ impl Spoof {
         let argv0 = raw_cmdline
             .split(|&b| b == 0)
             .next()
-            .filter(|a| !a.is_empty())
             .map(String::from_utf8_lossy);
         let exe = tree
             .exe(pid)
@@ -150,11 +156,12 @@ fn argv0_mismatches_exe(tree: &ProcTree, pid: u32, argv0: &str, exe: &Path) -> b
     let accepts = |candidate: &str| {
         let candidate = candidate.strip_suffix(':').unwrap_or(candidate);
         let arg_name = base_name(candidate).trim_start_matches('-');
-        arg_name.is_empty()
-            || exe_name.is_empty()
-            || is_name_variant(arg_name, exe_name)
-            || is_name_variant(exe_name, arg_name)
-            || resolves_like_a_shell_to_exe(tree, pid, candidate)
+        // An argv[0] with no usable name is itself suspicious when the exe is known.
+        !arg_name.is_empty()
+            && (exe_name.is_empty()
+                || is_name_variant(arg_name, exe_name)
+                || is_name_variant(exe_name, arg_name)
+                || resolves_like_a_shell_to_exe(tree, pid, candidate))
     };
     !(accepts(argv0) || accepts(first_token))
 }
@@ -312,6 +319,7 @@ fn fit_budget(entries: &mut [ChainEntry]) {
             .max_by_key(|e| e.cmdline.chars().count())
         else {
             shorten_longest_exe(entries, excess);
+            trim_longest_comms(entries);
             debug_assert_eq!(
                 excess_bytes(entries),
                 0,
@@ -328,6 +336,27 @@ fn fit_budget(entries: &mut [ChainEntry]) {
         shortened.push('…');
         longest.truncated_chars += (prev_kept - (target - 1)) as u32;
         longest.cmdline = shortened;
+    }
+}
+
+/// Final fallback: trim the longest comms (keeping a `…` marker, never below one
+/// char) until the chain fits or nothing is left to trim.
+fn trim_longest_comms(entries: &mut [ChainEntry]) {
+    while excess_bytes(entries) > 0 {
+        let Some(longest) = entries
+            .iter_mut()
+            .filter(|e| e.comm.chars().count() > 1)
+            .max_by_key(|e| e.comm.chars().count())
+        else {
+            return;
+        };
+        let len = longest.comm.chars().count();
+        longest.comm = longest
+            .comm
+            .chars()
+            .take(len.saturating_sub(2))
+            .chain(Some('…'))
+            .collect();
     }
 }
 
@@ -782,23 +811,25 @@ mod tests {
     #[test]
     fn worst_case_chains_always_pass_the_relay_limits() {
         let dir = TempDir::new();
-        let cases: [(&str, String); 3] = [
-            ("emoji", "\u{1F600}".repeat(300)),
-            ("cjk", "\u{4e2d}\u{6587}".repeat(300)),
+        let cases: [(&str, String, String); 3] = [
+            ("emoji", "\u{1F600}".repeat(300), "\u{FFFD}".repeat(5)),
+            ("cjk", "\u{4e2d}\u{6587}".repeat(300), "\"".repeat(15)),
             // quotes and backslashes double again when embedded in the FCM data
-            ("escapes", "\"\\".repeat(300)),
+            ("escapes", "\"\\".repeat(300), "\"".repeat(15)),
         ];
-        for (n, (name, text)) in cases.iter().enumerate() {
+        for (n, (name, text, comm)) in cases.iter().enumerate() {
             let root = dir.path().join(format!("case{n}"));
             std::fs::create_dir_all(&root).unwrap();
             for p in 1..=20u32 {
-                let pid = 4_000_000_000 + p;
+                let pid = 9_000_000 + p;
                 let d = root.join(pid.to_string());
                 std::fs::create_dir_all(&d).unwrap();
-                let ppid = if p == 1 { 0 } else { 4_000_000_000 + p - 1 };
+                let ppid = if p == 1 { 0 } else { 9_000_000 + p - 1 };
+                let filler = ["0"; 43].join(" ");
+                // args_moved: arg_end != env_start
                 std::fs::write(
                     d.join("stat"),
-                    format!("{pid} (\u{4e2d}\u{6587}\u{1F600}comm) S {ppid} 0 0\n"),
+                    format!("{pid} ({comm}) S {ppid} {filler} 100 200 900 1000\n"),
                 )
                 .unwrap();
                 std::fs::write(d.join("cmdline"), format!("{text}\0")).unwrap();
@@ -806,11 +837,31 @@ mod tests {
                     .unwrap();
             }
             let tree = ProcTree::with_root(&root);
-            let chain = command_chain_for_caller(&tree, 4_000_000_020, None);
+            let mut chain = command_chain_for_caller(&tree, 9_000_020, None);
             assert_eq!(chain.entries.len(), MAX_CHAIN_ENTRIES, "{name}");
             assert_eq!(chain.end, ChainEnd::DepthLimit, "{name}");
-            assert!(chain.entries.iter().all(|e| e.spoof.is_some()), "{name}");
+            for e in &mut chain.entries {
+                assert!(
+                    e.spoof
+                        .as_ref()
+                        .is_some_and(|s| s.exe.is_some() && s.args_moved),
+                    "{name}"
+                );
+                e.truncated_chars = u32::MAX;
+            }
+            // truncated_chars was set after fitting: refit to model the real worst case
+            fit_budget(&mut chain.entries);
             assert_relay_accepts(&chain.entries);
+        }
+    }
+
+    #[test]
+    fn empty_or_nameless_argv0_is_flagged_when_exe_is_known() {
+        for argv0 in ["", " sudo", "-", ":", "/usr/bin/sudo/"] {
+            assert!(
+                spoof_of(argv0, "/usr/bin/sudo", CONTIGUOUS).is_some_and(|s| s.exe.is_some()),
+                "{argv0:?}"
+            );
         }
     }
 
